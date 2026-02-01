@@ -218,25 +218,43 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 FILTER.ITEM_FILTER_COMPLETED_YES |
                 FILTER.ITEM_FILTER_COMPLETED_NO;
 
-              const items = await new Promise((resolve) => {
+              const opPromise = new Promise((resolve) => {
                 const out = [];
-                target.getItems(filter, 0, start, end, {
-                  onOperationComplete: function (_cal, _status, _opType, _id, _detail) {
-                    resolve(out);
-                  },
-                  onGetResult: function (_cal, _status, _opType, _id, _detail, count, items) {
-                    for (let i = 0; i < count; i++) {
-                      out.push(items[i]);
-                    }
-                  },
-                });
+                try {
+                  target.getItems(filter, 0, start, end, {
+                    onOperationComplete: function (_cal, _status, _opType, _id, _detail) {
+                      resolve({ items: out });
+                    },
+                    onGetResult: function (_cal, _status, _opType, _id, _detail, count, items) {
+                      for (let i = 0; i < count; i++) {
+                        out.push(items[i]);
+                      }
+                    },
+                  });
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
               });
+
+              const timeoutMs = 15000;
+              const timeoutPromise = new Promise((resolve) =>
+                Services.tm.dispatchToMainThread(() => {
+                  setTimeout(() => resolve({ timeout: true }), timeoutMs);
+                })
+              );
+
+              const result = await Promise.race([opPromise, timeoutPromise]);
+              if (result.error) return result;
+
+              const items = result.items || [];
 
               return {
                 success: true,
                 calendar: { id: target.id, name: target.name },
                 date,
                 count: items.length,
+                pending: !!result.timeout,
+                note: result.timeout ? `getItems did not return within ${timeoutMs}ms; results may be incomplete.` : undefined,
                 events: items.map((it) => ({
                   id: it.id || null,
                   title: it.title || null,
