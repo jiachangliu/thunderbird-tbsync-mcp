@@ -1,0 +1,9 @@
+# build artifacts
+/dist/
+*.xpi
+
+# node
+node_modules/
+
+# OS
+.DS_Store
