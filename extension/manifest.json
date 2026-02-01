@@ -3,19 +3,15 @@
   "name": "Thunderbird TbSync MCP",
   "version": "0.1.0",
   "description": "MCP server for safe calendar edits with forced TbSync sync (EAS)",
-  "applications": {
+  "browser_specific_settings": {
     "gecko": {
       "id": "thunderbird-tbsync-mcp@luthriel.dev",
       "strict_min_version": "128.0"
     }
   },
   "background": {
-    "type": "module",
     "scripts": ["background.js"]
   },
-  "permissions": [
-    "notifications"
-  ],
   "experiment_apis": {
     "tbsyncMcpServer": {
       "schema": "mcp_server/schema.json",
@@ -25,5 +21,11 @@
         "script": "mcp_server/api.js"
       }
     }
-  }
+  },
+  "permissions": [
+    "notifications"
+  ],
+  "web_accessible_resources": [
+    "httpd.sys.mjs"
+  ]
 }
