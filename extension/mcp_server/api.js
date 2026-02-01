@@ -242,7 +242,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               ev.startDate = start;
               ev.endDate = end;
 
-              const result = await new Promise((resolve) => {
+              const opPromise = new Promise((resolve) => {
                 try {
                   target.addItem(ev, {
                     onOperationComplete: function (_cal, status, opType, id, detail) {
@@ -255,6 +255,17 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               });
 
+              // Some calendar providers can take a long time to respond. Avoid hanging the MCP call.
+              const timeoutMs = 15000;
+              const timeoutPromise = new Promise((resolve) =>
+                Services.tm.dispatchToMainThread(() => {
+                  // Use a main-thread dispatch to ensure the timer is scheduled.
+                  setTimeout(() => resolve({ timeout: true }), timeoutMs);
+                })
+              );
+
+              const result = await Promise.race([opPromise, timeoutPromise]);
+
               if (result.error) return result;
 
               return {
@@ -264,7 +275,13 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 title,
                 allDay: true,
                 date,
+                pending: !!result.timeout,
+                note: result.timeout ? `addItem did not return within ${timeoutMs}ms; event may still be created and will appear after provider finishes.` : undefined,
               };
+            }
+
+            async function sleepMs(ms) {
+              return new Promise((resolve) => setTimeout(resolve, ms));
             }
 
             async function syncAndCreateCalendarEvent(args) {
@@ -276,13 +293,14 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               const pre = await tbsyncSyncAccountByUser(tbsyncUser);
               if (pre.error) return pre;
+              // Give TbSync a moment to start pulling updates.
+              await sleepMs(2000);
 
               const created = await createCalendarEvent(args);
               if (created.error) return created;
 
               const post = await tbsyncSyncAccountByUser(tbsyncUser);
               if (post.error) {
-                // Event already created locally; report post-sync error explicitly.
                 return { error: post.error, created };
               }
 
