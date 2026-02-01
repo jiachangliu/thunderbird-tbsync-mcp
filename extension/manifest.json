@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Thunderbird TbSync MCP",
-  "version": "0.6.5",
+  "version": "0.7.2",
   "description": "MCP server for safe calendar edits with forced TbSync sync (EAS)",
   "browser_specific_settings": {
     "gecko": {
