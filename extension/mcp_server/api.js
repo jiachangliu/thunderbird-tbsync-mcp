@@ -110,6 +110,34 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
             const _calendarJobs = new Map();
             let _calendarJobSeq = 0;
 
+            // Idempotency cache to prevent duplicate creates when a user repeats the same request.
+            // Keyed by calendar+tag+time. TTL-based (in-memory only).
+            const _idempotency = new Map();
+            const IDEMPOTENCY_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+            // Workflow jobs (non-blocking sync->create->sync sequences)
+            const _workflowJobs = new Map();
+            let _workflowSeq = 0;
+            function newWorkflowJobId() {
+              _workflowSeq += 1;
+              return `wfjob-${Date.now()}-${_workflowSeq}`;
+            }
+            function getWorkflowJob(jobId) {
+              const job = _workflowJobs.get(String(jobId));
+              if (!job) return { error: `Unknown workflow jobId: ${jobId}` };
+              return {
+                success: true,
+                jobId: job.jobId,
+                status: job.status,
+                createdAtMs: job.createdAtMs,
+                updatedAtMs: job.updatedAtMs,
+                step: job.step,
+                meta: job.meta,
+                result: job.result || null,
+                error: job.error || null,
+              };
+            }
+
             function newCalendarJobId() {
               _calendarJobSeq += 1;
               return `caljob-${Date.now()}-${_calendarJobSeq}`;
@@ -128,7 +156,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               _calendarJobs.set(jobId, job);
 
               try {
-                target.getItems(filter, 0, startDt, endDt, {
+                const listener = {
                   onOperationComplete: function () {
                     job.status = "done";
                   },
@@ -144,7 +172,10 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                       });
                     }
                   },
-                });
+                };
+                // Keep listener alive until completion.
+                job._listener = listener;
+                target.getItems(filter, 0, startDt, endDt, listener);
               } catch (e) {
                 job.status = "error";
                 job.error = e.toString();
@@ -167,7 +198,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               _calendarJobs.set(jobId, job);
 
               try {
-                target.addItem(item, {
+                const listener = {
                   onOperationComplete: function (_cal, status, _opType, id, _detail) {
                     job.itemId = id || null;
                     // status is an nsresult; if non-zero, treat as error.
@@ -179,7 +210,10 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                   },
                   onGetResult: function () {},
-                });
+                };
+                // Keep listener alive until completion.
+                job._listener = listener;
+                target.addItem(item, listener);
               } catch (e) {
                 job.status = "error";
                 job.error = e.toString();
@@ -500,6 +534,39 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               return target;
             }
 
+            function maybeRefreshCalendar(target) {
+              try {
+                if (target && typeof target.refresh === "function") {
+                  target.refresh();
+                  return { refreshed: true };
+                }
+              } catch (e) {
+                return { refreshed: false, error: e.toString() };
+              }
+              return { refreshed: false };
+            }
+
+            function shortTagForEvent(args) {
+              const { allDay, date, start, end } = args || {};
+              if (allDay && date) return `mcp:${String(date).replace(/-/g, "")}`; // mcp:20260204
+              if (!allDay && start && end) {
+                const s = String(start).replace(/[-:T\s]/g, ""); // 20260204HHMM
+                const e = String(end).replace(/[-:T\s]/g, "");
+                // keep short: date+start-end times
+                return `mcp:${s.slice(0, 8)}-${s.slice(8, 12)}-${e.slice(8, 12)}`; // mcp:20260204-0600-0700
+              }
+              return "mcp";
+            }
+
+            function withTagAtEnd(title, tag) {
+              const base = String(title || "").trim();
+              const t = String(tag || "").trim();
+              if (!t) return base;
+              // Put tag at the very end, short.
+              if (base.endsWith(`(${t})`)) return base;
+              return `${base} (${t})`;
+            }
+
             async function createCalendarEvent(args) {
               if (!cal) {
                 return { error: "Calendar not available" };
@@ -514,6 +581,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // Timed:
                 start,
                 end,
+                // Optional short tag placed at end of title.
+                mcpTag,
               } = args || {};
 
               if (!title) return { error: "Missing required field: title" };
@@ -527,8 +596,16 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: `Calendar is read-only: ${target.name}` };
               }
 
+              // Some providers won't return results or complete operations until the calendar is refreshed.
+              maybeRefreshCalendar(target);
+
               const ev = Cc["@mozilla.org/calendar/event;1"].createInstance(Ci.calIEvent);
-              ev.title = title;
+              const tag = mcpTag ? String(mcpTag).trim() : shortTagForEvent({ allDay, date, start, end });
+              ev.title = withTagAtEnd(title, tag);
+              // Also store tag in a property for debugging/search in raw iCal.
+              try {
+                ev.setProperty("X-MCP-TAG", tag);
+              } catch {}
               if (description) {
                 ev.setProperty("DESCRIPTION", description);
               }
@@ -577,27 +654,104 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               await timeoutAfter(ms);
             }
 
+            function cleanupIdempotency() {
+              const now = Date.now();
+              for (const [k, v] of _idempotency.entries()) {
+                if (!v || !v.ts || now - v.ts > IDEMPOTENCY_TTL_MS) {
+                  _idempotency.delete(k);
+                }
+              }
+            }
+
+            function idempotencyKey(args) {
+              // calendar+time+tag
+              const calKey = (args && (args.calendarId || args.calendarName)) || "";
+              const timeKey = args && args.allDay ? String(args.date || "") : `${args.start || ""}-${args.end || ""}`;
+              const tag = args && args.mcpTag ? String(args.mcpTag).trim() : shortTagForEvent(args);
+              return `${calKey}|${timeKey}|${tag}`;
+            }
+
             async function syncAndCreateCalendarEvent(args) {
-              // Workflow: sync (by TbSync user email) -> create -> sync
+              // Non-blocking robust workflow.
+              // Returns immediately with a workflowJobId.
               const { tbsyncUser } = args || {};
               if (!tbsyncUser) {
                 return { error: "Missing required field: tbsyncUser (email)" };
               }
 
-              const pre = await tbsyncSyncAccountByUser(tbsyncUser);
-              if (pre.error) return pre;
-              // Give TbSync a moment to start pulling updates.
-              await sleepMs(2000);
+              cleanupIdempotency();
 
-              const created = await createCalendarEvent(args);
-              if (created.error) return created;
+              const tag = (args && args.mcpTag) ? String(args.mcpTag).trim() : shortTagForEvent(args);
+              const argsWithTag = Object.assign({}, args, { mcpTag: tag, title: withTagAtEnd(args.title, tag) });
 
-              const post = await tbsyncSyncAccountByUser(tbsyncUser);
-              if (post.error) {
-                return { error: post.error, created };
+              const key = idempotencyKey(argsWithTag);
+              const seen = _idempotency.get(key);
+              if (seen) {
+                return {
+                  success: true,
+                  alreadyCreated: true,
+                  idempotencyKey: key,
+                  created: seen.created || null,
+                  note: "Duplicate request suppressed (idempotency cache).",
+                };
               }
 
-              return { success: true, preSync: pre, created, postSync: post };
+              const wfJobId = newWorkflowJobId();
+              const job = {
+                jobId: wfJobId,
+                status: "running",
+                createdAtMs: Date.now(),
+                updatedAtMs: Date.now(),
+                step: "start",
+                meta: { idempotencyKey: key, tbsyncUser, calendar: argsWithTag.calendarId || argsWithTag.calendarName || null },
+                result: null,
+                error: null,
+              };
+              _workflowJobs.set(wfJobId, job);
+
+              // Mark idempotency immediately to avoid duplicates while the workflow runs.
+              _idempotency.set(key, { ts: Date.now(), created: { pending: true, workflowJobId: wfJobId } });
+
+              (async () => {
+                try {
+                  job.step = "preSync";
+                  job.updatedAtMs = Date.now();
+                  const pre = await tbsyncSyncAccountByUser(tbsyncUser);
+
+                  job.step = "create";
+                  job.updatedAtMs = Date.now();
+                  await sleepMs(1500);
+                  const created = await createCalendarEvent(argsWithTag);
+
+                  job.step = "postSync";
+                  job.updatedAtMs = Date.now();
+                  await sleepMs(1500);
+                  const post = await tbsyncSyncAccountByUser(tbsyncUser);
+                  await sleepMs(1500);
+                  const post2 = await tbsyncSyncAccountByUser(tbsyncUser);
+
+                  job.status = "done";
+                  job.step = "done";
+                  job.updatedAtMs = Date.now();
+                  job.result = { preSync: pre, created, postSync: post, postSync2: post2 };
+
+                  // Update idempotency cache with actual created payload.
+                  _idempotency.set(key, { ts: Date.now(), created: { preSync: pre, created, postSync: post, postSync2: post2 } });
+                } catch (e) {
+                  job.status = "error";
+                  job.step = "error";
+                  job.updatedAtMs = Date.now();
+                  job.error = e.toString();
+                }
+              })();
+
+              return {
+                success: true,
+                pending: true,
+                workflowJobId: wfJobId,
+                idempotencyKey: key,
+                note: "Workflow started (sync→create→sync). Poll with getWorkflowJob(workflowJobId).",
+              };
             }
 
             const tools = [
@@ -648,6 +802,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     date: { type: "string", description: "YYYY-MM-DD (required when allDay=true)" },
                     start: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
                     end: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
+                    mcpTag: { type: "string", description: "Optional short tag appended to title (placed at end)." }
                   },
                   required: ["title", "allDay"],
                 },
@@ -694,6 +849,18 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 },
               },
               {
+                name: "getWorkflowJob",
+                title: "Get Workflow Job",
+                description: "Poll a non-blocking sync→create→sync workflow job",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    workflowJobId: { type: "string" }
+                  },
+                  required: ["workflowJobId"],
+                },
+              },
+              {
                 name: "syncAndCreateCalendarEvent",
                 title: "Sync + Create Calendar Event",
                 description: "Pre-sync, create event locally, then post-sync (safest workflow)",
@@ -709,6 +876,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     date: { type: "string", description: "YYYY-MM-DD (required when allDay=true)" },
                     start: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
                     end: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
+                    mcpTag: { type: "string", description: "Optional short tag appended to title (placed at end)." }
                   },
                   required: ["tbsyncUser", "title", "allDay"],
                 },
@@ -735,6 +903,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return getCalendarJob(args.jobId);
                 case "syncAndCreateCalendarEvent":
                   return await syncAndCreateCalendarEvent(args);
+                case "getWorkflowJob":
+                  return getWorkflowJob(args.workflowJobId);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
