@@ -1,0 +1,15 @@
+[
+  {
+    "namespace": "tbsyncMcpServer",
+    "description": "MCP HTTP server for TbSync calendar sync + calendar event creation",
+    "functions": [
+      {
+        "name": "start",
+        "type": "function",
+        "async": true,
+        "description": "Start the TbSync MCP HTTP server on localhost:8766",
+        "parameters": []
+      }
+    ]
+  }
+]
