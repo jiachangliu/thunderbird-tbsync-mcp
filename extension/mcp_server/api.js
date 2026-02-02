@@ -531,19 +531,80 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               return t >= startJs.getTime() && t < endJs.getTime();
             }
 
-            async function tbsyncListEasCalendarFolders() {
+            async function tbsyncListEasCalendarFolders(args) {
+              const { tbsyncUser, includeUnselected, types } = args || {};
               const TbSyncModule = await getTbSyncModule();
               try {
                 const provider = new TbSyncModule.ProviderData("eas");
-                const folders = provider.getFolders({ selected: true, type: ["8", "13"] });
-                return folders.map((f) => ({
+                const folderArgs = { selected: includeUnselected ? false : true };
+                if (Array.isArray(types) && types.length > 0) folderArgs.type = types;
+                else folderArgs.type = ["8", "13"]; // default: calendars
+
+                const folders = provider.getFolders(folderArgs);
+                return folders
+                  .filter((f) => {
+                    if (!tbsyncUser) return true;
+                    const u = String(f.accountData.getAccountProperty("user") || "");
+                    return u === String(tbsyncUser);
+                  })
+                  .map((f) => ({
+                    accountID: String(f.accountID),
+                    folderID: String(f.folderID),
+                    type: String(f.getFolderProperty("type") || ""),
+                    serverID: String(f.getFolderProperty("serverID") || ""),
+                    foldername: String(f.getFolderProperty("foldername") || ""),
+                    selected: !!f.getFolderProperty("selected"),
+                    targetCalendarId: String(f.getFolderProperty("target") || ""),
+                    targetName: String(f.getFolderProperty("targetName") || ""),
+                  }));
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function tbsyncSelectEasCalendarFolder(args) {
+              const { tbsyncUser, serverID, foldername } = args || {};
+              if (!tbsyncUser) return { error: "Missing required field: tbsyncUser" };
+              if (!serverID && !foldername) return { error: "Provide serverID or foldername" };
+
+              const TbSyncModule = await getTbSyncModule();
+              try {
+                const provider = new TbSyncModule.ProviderData("eas");
+                const folders = provider.getFolders({ selected: false, type: ["8", "13"] });
+
+                const candidates = folders.filter((f) => {
+                  const u = String(f.accountData.getAccountProperty("user") || "");
+                  if (u !== String(tbsyncUser)) return false;
+                  if (serverID && String(f.getFolderProperty("serverID") || "") !== String(serverID)) return false;
+                  if (foldername && String(f.getFolderProperty("foldername") || "") !== String(foldername)) return false;
+                  return true;
+                });
+
+                if (candidates.length === 0) return { error: "No matching folder found" };
+
+                const f = candidates[0];
+                f.setFolderProperty("selected", true);
+                f.setFolderProperty("status", "aborted");
+                f.accountData.setAccountProperty("status", "notsyncronized");
+                Services.obs.notifyObservers(null, "tbsync.observer.manager.updateSyncstate", f.accountID);
+
+                let targetId = null;
+                let targetName = null;
+                const tbCalendar = await f.targetData.getTarget();
+                targetId = String(tbCalendar.calendar.id || "");
+                targetName = String(tbCalendar.calendar.name || "");
+
+                try { tbsyncSyncAccountByUser(tbsyncUser); } catch {}
+
+                return {
+                  success: true,
                   accountID: String(f.accountID),
-                  folderID: String(f.folderID),
-                  type: String(f.getFolderProperty("type") || ""),
                   serverID: String(f.getFolderProperty("serverID") || ""),
-                  targetCalendarId: String(f.getFolderProperty("target") || ""),
-                  targetName: String(f.getFolderProperty("targetName") || ""),
-                }));
+                  foldername: String(f.getFolderProperty("foldername") || ""),
+                  targetCalendarId: targetId,
+                  targetName,
+                  note: "Folder selected and target calendar ensured. Sync triggered once.",
+                };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -997,6 +1058,31 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               TbSyncModule.core.syncAccount(matches[0]);
               return { success: true, accountID: matches[0], user: needle, triggered: true };
+            }
+
+            async function tbsyncResetEasFolderSync(userEmail) {
+              // Force EAS FolderSync to re-run from scratch by clearing the foldersynckey.
+              // This is needed if TbSync's folder list got corrupted/missing the primary Calendar.
+              const TbSyncModule = await getTbSyncModule();
+              const accounts = TbSyncModule.db.getAccounts();
+              const needle = (userEmail || "").toLowerCase().trim();
+              const matches = accounts.IDs.filter((id) => {
+                const data = accounts.data[id];
+                return (data.user || "").toLowerCase().trim() === needle && (data.provider || "") === "eas";
+              });
+              if (matches.length === 0) return { error: `No EAS TbSync account found with user=${needle}` };
+              if (matches.length > 1) return { error: `Multiple EAS TbSync accounts found with user=${needle}: ${matches.join(",")}` };
+
+              const accountID = matches[0];
+              try {
+                TbSyncModule.db.setAccountProperty(accountID, "foldersynckey", "");
+                TbSyncModule.db.setAccountProperty(accountID, "status", "notsyncronized");
+              } catch (e) {
+                return { error: `Failed to reset foldersynckey: ${e}` };
+              }
+
+              TbSyncModule.core.syncAccount(accountID);
+              return { success: true, accountID, user: needle, reset: true, triggered: true };
             }
 
             function listCalendars() {
@@ -1465,6 +1551,16 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 },
               },
               {
+                name: "tbsyncResetEasFolderSync",
+                title: "TbSync Reset EAS FolderSync",
+                description: "Clear EAS foldersynckey to force refetch of folder hierarchy (repairs missing primary Calendar folder)",
+                inputSchema: {
+                  type: "object",
+                  properties: { userEmail: { type: "string" } },
+                  required: ["userEmail"],
+                },
+              },
+              {
                 name: "listCalendars",
                 title: "List Calendars",
                 description: "List Thunderbird calendars",
@@ -1473,8 +1569,30 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               {
                 name: "tbsyncListEasCalendarFolders",
                 title: "TbSync List EAS Calendar Folders",
-                description: "List selected EAS calendar folders and their mapped Thunderbird calendar ids",
-                inputSchema: { type: "object", properties: {}, required: [] },
+                description: "List EAS calendar folders (selected by default; set includeUnselected=true to list all)",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    tbsyncUser: { type: "string" },
+                    includeUnselected: { type: "boolean" },
+                    types: { type: "array", items: { type: "string" } }
+                  },
+                  required: [],
+                },
+              },
+              {
+                name: "tbsyncSelectEasCalendarFolder",
+                title: "TbSync Select EAS Calendar Folder",
+                description: "Select an EAS calendar folder (subscribe) and ensure its Thunderbird calendar target exists, then sync",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    tbsyncUser: { type: "string" },
+                    serverID: { type: "string" },
+                    foldername: { type: "string" }
+                  },
+                  required: ["tbsyncUser"],
+                },
               },
               {
                 name: "tbsyncDeleteEasEventsByTitleRange",
@@ -1708,10 +1826,14 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await tbsyncSyncAccount(args.accountID);
                 case "tbsyncSyncAccountByUser":
                   return await tbsyncSyncAccountByUser(args.userEmail);
+                case "tbsyncResetEasFolderSync":
+                  return await tbsyncResetEasFolderSync(args.userEmail);
                 case "listCalendars":
                   return listCalendars();
                 case "tbsyncListEasCalendarFolders":
-                  return await tbsyncListEasCalendarFolders();
+                  return await tbsyncListEasCalendarFolders(args);
+                case "tbsyncSelectEasCalendarFolder":
+                  return await tbsyncSelectEasCalendarFolder(args);
                 case "tbsyncDeleteEasEventsByTitleRange":
                   return await tbsyncDeleteEasEventsByTitleRange(args);
                 case "tbsyncDeleteEasEventsBySqlChangelog":
