@@ -51,6 +51,7 @@ Implemented tools are exposed via JSON-RPC on `http://localhost:8766`.
 Start here:
 - `docs/USAGE.md` — quick-start + copy/paste curl examples
 - `docs/TROUBLESHOOTING.md` — common issues (port not listening, hangs, dependency checks)
+- `docs/PROCESS_RULES.md` — **operational rules / source of truth** for reliable TbSync+EAS workflows
 
 ## Development notes
 
