@@ -611,9 +611,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             async function tbsyncDeleteEasEventsBySqlChangelog(args) {
-              // Robust delete for EAS:
-              // Use local.sqlite to find candidate item ids, then add TbSync changelog entries "deleted_by_user".
-              // Next TbSync sync should issue server-side deletes.
+              // Legacy approach (manual changelog writes). Kept for reference, but NOT recommended.
+              // It can fail when TbSync expects different parentId/itemId formatting.
               const { tbsyncUser, calendarId, calendarName, start, end, titleMustContainAll } = args || {};
               if (!tbsyncUser) return { error: "Missing required field: tbsyncUser" };
               if (!start || !end) return { error: "Missing required fields: start, end (YYYY-MM-DDTHH:MM)" };
@@ -666,13 +665,108 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 } catch {}
               }
 
-              // Trigger sync
               try {
-                tbsyncSyncAccountByUser(tbsyncUser);
                 tbsyncSyncAccountByUser(tbsyncUser);
               } catch {}
 
-              return { success: true, calendarId: targetCal.id, candidateCount: ids.length, sample: ids.slice(0, 10) };
+              return { success: true, calendarId: targetCal.id, candidateCount: ids.length, sample: ids.slice(0, 10), note: "Legacy changelog-based delete; may not be processed by TbSync." };
+            }
+
+            async function tbsyncDeleteEasEventsNativeBySql(args) {
+              // Robust delete for EAS calendars:
+              // 1) query local.sqlite for candidate ids
+              // 2) resolve TbSync EAS folder -> TbCalendar
+              // 3) tbCalendar.getItem(id) -> tbCalendar.deleteItem(tbItem, false)  (user delete)
+              // 4) trigger TbSync sync
+              const { tbsyncUser, calendarId, calendarName, start, end, titleMustContainAll } = args || {};
+              if (!tbsyncUser) return { error: "Missing required field: tbsyncUser" };
+              if (!start || !end) return { error: "Missing required fields: start, end (YYYY-MM-DDTHH:MM)" };
+
+              const targetCal = resolveCalendar({ calendarId, calendarName });
+              if (!targetCal) return { error: "Calendar not found" };
+
+              const range = makeTimedRange(start, end);
+              if (!range) return { error: `Invalid datetime format (expected YYYY-MM-DDTHH:MM): start=${start} end=${end}` };
+              if (range.error) return { error: range.error };
+
+              const TbSyncModule = await getTbSyncModule();
+
+              // Find the EAS folder mapped to this calendar id.
+              const provider = new TbSyncModule.ProviderData("eas");
+              const folders = provider.getFolders({ selected: true, type: ["8", "13"] });
+              const matchingFolders = folders.filter((f) => String(f.getFolderProperty("target") || "") === String(targetCal.id));
+              if (matchingFolders.length === 0) return { error: "No selected EAS folder mapped to this calendar" };
+
+              const { Sqlite } = ChromeUtils.importESModule("resource://gre/modules/Sqlite.sys.mjs");
+              const prof = Services.dirsvc.get("ProfD", Ci.nsIFile);
+              prof.append("calendar-data");
+              prof.append("local.sqlite");
+              const dbPath = prof.path;
+
+              // Query candidates by title and range.
+              const conn = await Sqlite.openConnection({ path: dbPath });
+              let ids = [];
+              try {
+                const params = {
+                  cal_id: targetCal.id,
+                  start_us: range.start.nativeTime,
+                  end_us: range.end.nativeTime,
+                };
+                const clauses = ["cal_id = :cal_id", "event_start >= :start_us AND event_start < :end_us"]; 
+                let idx = 0;
+                for (const kwRaw of (titleMustContainAll || [])) {
+                  const kw = String(kwRaw || "").toLowerCase().trim();
+                  if (!kw) continue;
+                  idx += 1;
+                  const key = `kw${idx}`;
+                  params[key] = `%${kw}%`;
+                  clauses.push(`lower(title) LIKE :${key}`);
+                }
+                const sql = `SELECT id, title FROM cal_events WHERE ${clauses.join(" AND ")}`;
+                const rows = await conn.execute(sql, params);
+                ids = rows.map((r) => ({ id: String(r.getResultByName("id")), title: String(r.getResultByName("title") || "") }));
+              } finally {
+                await conn.close();
+              }
+
+              let deleted = 0;
+              let notFound = 0;
+              let errors = [];
+
+              // Delete across all mapped folders (usually 1).
+              for (const folder of matchingFolders) {
+                let tbCalendar;
+                try {
+                  tbCalendar = await folder.targetData.getTarget();
+                } catch (e) {
+                  errors.push(e.toString());
+                  continue;
+                }
+
+                for (const it of ids) {
+                  try {
+                    const tbItem = await Promise.race([
+                      tbCalendar.getItem(it.id),
+                      timeoutAfter(3000).then(() => null),
+                    ]);
+                    if (!tbItem) {
+                      notFound += 1;
+                      continue;
+                    }
+                    await tbCalendar.deleteItem(tbItem, false);
+                    deleted += 1;
+                  } catch (e) {
+                    errors.push(e.toString());
+                  }
+                }
+              }
+
+              // Trigger sync once (then we wait)
+              try {
+                tbsyncSyncAccountByUser(tbsyncUser);
+              } catch {}
+
+              return { success: true, calendarId: targetCal.id, candidateCount: ids.length, deleted, notFound, errors: errors.slice(0, 5), sample: ids.slice(0, 10) };
             }
 
             async function tbsyncModifyEasEventsBySql(args) {
@@ -1319,7 +1413,24 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               {
                 name: "tbsyncDeleteEasEventsBySqlChangelog",
                 title: "TbSync Delete EAS Events (SQL→Changelog)",
-                description: "Robust: find matching items via local.sqlite, then mark deleted_by_user in TbSync changelog and sync",
+                description: "Legacy: find matches via local.sqlite, then write deleted_by_user directly to TbSync changelog (not recommended)",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    tbsyncUser: { type: "string" },
+                    calendarName: { type: "string" },
+                    calendarId: { type: "string" },
+                    start: { type: "string" },
+                    end: { type: "string" },
+                    titleMustContainAll: { type: "array", items: { type: "string" } }
+                  },
+                  required: ["tbsyncUser", "start", "end", "titleMustContainAll"],
+                },
+              },
+              {
+                name: "tbsyncDeleteEasEventsNativeBySql",
+                title: "TbSync Delete EAS Events (SQL→TbSync deleteItem)",
+                description: "Robust: find matches via local.sqlite, then delete via TbSync lightning wrapper as user deletes and sync",
                 inputSchema: {
                   type: "object",
                   properties: {
@@ -1500,6 +1611,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await tbsyncDeleteEasEventsByTitleRange(args);
                 case "tbsyncDeleteEasEventsBySqlChangelog":
                   return await tbsyncDeleteEasEventsBySqlChangelog(args);
+                case "tbsyncDeleteEasEventsNativeBySql":
+                  return await tbsyncDeleteEasEventsNativeBySql(args);
                 case "tbsyncModifyEasEventsBySql":
                   return await tbsyncModifyEasEventsBySql(args);
                 case "createCalendarEvent":
