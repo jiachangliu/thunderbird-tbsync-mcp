@@ -674,10 +674,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             async function tbsyncDeleteEasEventsNativeBySql(args) {
               // Robust delete for EAS calendars:
-              // 1) query local.sqlite for candidate ids
-              // 2) resolve TbSync EAS folder -> TbCalendar
-              // 3) tbCalendar.getItem(id) -> tbCalendar.deleteItem(tbItem, false)  (user delete)
-              // 4) trigger TbSync sync
+              // SQL find -> TbSync TbCalendar.getItem -> set deleted_by_user -> TbCalendar.deleteItem -> sync
               const { tbsyncUser, calendarId, calendarName, start, end, titleMustContainAll } = args || {};
               if (!tbsyncUser) return { error: "Missing required field: tbsyncUser" };
               if (!start || !end) return { error: "Missing required fields: start, end (YYYY-MM-DDTHH:MM)" };
@@ -691,7 +688,6 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               const TbSyncModule = await getTbSyncModule();
 
-              // Find the EAS folder mapped to this calendar id.
               const provider = new TbSyncModule.ProviderData("eas");
               const folders = provider.getFolders({ selected: true, type: ["8", "13"] });
               const matchingFolders = folders.filter((f) => String(f.getFolderProperty("target") || "") === String(targetCal.id));
@@ -703,7 +699,6 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               prof.append("local.sqlite");
               const dbPath = prof.path;
 
-              // Query candidates by title and range.
               const conn = await Sqlite.openConnection({ path: dbPath });
               let ids = [];
               try {
@@ -733,7 +728,6 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               let notFound = 0;
               let errors = [];
 
-              // Delete across all mapped folders (usually 1).
               for (const folder of matchingFolders) {
                 let tbCalendar;
                 try {
@@ -753,6 +747,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                       notFound += 1;
                       continue;
                     }
+                    tbItem.changelogStatus = "deleted_by_user";
                     await tbCalendar.deleteItem(tbItem, false);
                     deleted += 1;
                   } catch (e) {
@@ -761,12 +756,100 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
 
-              // Trigger sync once (then we wait)
               try {
                 tbsyncSyncAccountByUser(tbsyncUser);
               } catch {}
 
               return { success: true, calendarId: targetCal.id, candidateCount: ids.length, deleted, notFound, errors: errors.slice(0, 5), sample: ids.slice(0, 10) };
+            }
+
+            async function tbsyncCreateEasEventNative(args) {
+              // Create an event via TbSync lightning wrapper (ensures _by_user changelog) then sync.
+              const {
+                tbsyncUser,
+                calendarId,
+                calendarName,
+                title,
+                description,
+                location,
+                allDay,
+                date,
+                start,
+                end,
+                mcpTag,
+              } = args || {};
+
+              if (!tbsyncUser) return { error: "Missing required field: tbsyncUser" };
+              if (!title) return { error: "Missing required field: title" };
+
+              const targetCal = resolveCalendar({ calendarId, calendarName });
+              if (!targetCal) return { error: "Calendar not found" };
+
+              const TbSyncModule = await getTbSyncModule();
+              const provider = new TbSyncModule.ProviderData("eas");
+              const folders = provider.getFolders({ selected: true, type: ["8", "13"] });
+              const matchingFolders = folders.filter((f) => String(f.getFolderProperty("target") || "") === String(targetCal.id));
+              if (matchingFolders.length === 0) return { error: "No selected EAS folder mapped to this calendar" };
+
+              // Build the Lightning calEvent using existing helpers.
+              let created = 0;
+              let errors = [];
+              let itemId = null;
+
+              for (const folder of matchingFolders) {
+                let tbCalendar;
+                try {
+                  tbCalendar = await folder.targetData.getTarget();
+                } catch (e) {
+                  errors.push(e.toString());
+                  continue;
+                }
+
+                try {
+                  if (typeof allDay !== "boolean") throw new Error("Missing required field: allDay (boolean)");
+
+                  const tag = mcpTag ? String(mcpTag).trim() : shortTagForEvent({ allDay, date, start, end });
+
+                  const ev = Cc["@mozilla.org/calendar/event;1"].createInstance(Ci.calIEvent);
+                  ev.title = withTagAtEnd(title, tag);
+                  try { ev.setProperty("X-MCP-TAG", tag); } catch {}
+                  if (description) {
+                    try { ev.setProperty("DESCRIPTION", description); } catch {}
+                  }
+                  if (location) {
+                    try { ev.setProperty("LOCATION", location); } catch {}
+                  }
+
+                  let range = null;
+                  if (allDay) {
+                    if (!date) throw new Error("Missing required field for all-day events: date (YYYY-MM-DD)");
+                    range = makeAllDayRange(date);
+                    if (!range) throw new Error(`Invalid date format (expected YYYY-MM-DD): ${date}`);
+                  } else {
+                    if (!start || !end) throw new Error("Missing required fields for timed events: start, end (YYYY-MM-DDTHH:MM)");
+                    range = makeTimedRange(start, end);
+                    if (!range) throw new Error(`Invalid datetime format (expected YYYY-MM-DDTHH:MM): start=${start} end=${end}`);
+                    if (range.error) throw new Error(range.error);
+                  }
+
+                  ev.startDate = range.start;
+                  ev.endDate = range.end;
+
+                  const tbItem = new TbSyncModule.lightning.TbItem(tbCalendar, ev);
+                  tbItem.changelogStatus = "added_by_user";
+                  await tbCalendar.addItem(tbItem, false);
+                  itemId = String(ev.id || "") || null;
+                  created += 1;
+                } catch (e) {
+                  errors.push(e.toString());
+                }
+              }
+
+              try {
+                tbsyncSyncAccountByUser(tbsyncUser);
+              } catch {}
+
+              return { success: true, calendarId: targetCal.id, created, itemId, errors: errors.slice(0, 5) };
             }
 
             async function tbsyncModifyEasEventsBySql(args) {
@@ -1445,6 +1528,28 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 },
               },
               {
+                name: "tbsyncCreateEasEventNative",
+                title: "TbSync Create EAS Event (native addItem)",
+                description: "Robust: create event through TbSync lightning wrapper as user adds and sync",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    tbsyncUser: { type: "string" },
+                    calendarName: { type: "string" },
+                    calendarId: { type: "string" },
+                    title: { type: "string" },
+                    description: { type: "string" },
+                    location: { type: "string" },
+                    allDay: { type: "boolean" },
+                    date: { type: "string" },
+                    start: { type: "string" },
+                    end: { type: "string" },
+                    mcpTag: { type: "string" }
+                  },
+                  required: ["tbsyncUser", "title", "allDay"],
+                },
+              },
+              {
                 name: "tbsyncModifyEasEventsBySql",
                 title: "TbSync Modify EAS Events (SQL→modifyItem)",
                 description: "Modify/move events without delete+recreate: find candidates via local.sqlite, then modifyItem as user and sync",
@@ -1613,6 +1718,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await tbsyncDeleteEasEventsBySqlChangelog(args);
                 case "tbsyncDeleteEasEventsNativeBySql":
                   return await tbsyncDeleteEasEventsNativeBySql(args);
+                case "tbsyncCreateEasEventNative":
+                  return await tbsyncCreateEasEventNative(args);
                 case "tbsyncModifyEasEventsBySql":
                   return await tbsyncModifyEasEventsBySql(args);
                 case "createCalendarEvent":
