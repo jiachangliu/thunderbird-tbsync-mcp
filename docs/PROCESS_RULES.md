@@ -72,10 +72,17 @@ Fix (programmatic):
 2) Re-select the EAS folder `foldername="Calendar"` (often `serverID="2"`) via `tbsyncSelectEasCalendarFolder`.
 3) Confirm `listCalendars` includes `Jiachang Liu Cornell (Calendar)`.
 
+## Morning planning pass (daily)
+
+- The morning plan must be based on:
+  - **Cornell calendar AND Duke calendar** (latest synced state)
+  - `productivity/todo.csv` + `productivity/README.md`
+- Always surface fixed-time commitments first (especially interviews).
+
 ## Operational Checklist (for risky sessions)
 
 - Before making changes:
-  - Confirm target calendar = Cornell.
+  - Confirm target calendar = Cornell (unless explicitly using Duke).
   - Confirm TbSync account user = `jl4624@cornell.edu`.
 
 - After making changes:
