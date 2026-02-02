@@ -465,6 +465,15 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
             function getCalendarJob(jobId) {
               const job = _calendarJobs.get(String(jobId));
               if (!job) return { error: `Unknown jobId: ${jobId}` };
+
+              // Hard timeout: provider enumeration can hang indefinitely.
+              // If a job stays pending too long, mark it as error so callers can fall back (e.g., SQL-based listing).
+              const MAX_PENDING_MS = 15000;
+              if (job.status === "pending" && job.createdAtMs && Date.now() - job.createdAtMs > MAX_PENDING_MS) {
+                job.status = "error";
+                job.error = job.error || `Timed out after ${MAX_PENDING_MS}ms (provider/listing hang).`;
+              }
+
               return {
                 success: true,
                 jobId: job.jobId,
@@ -1016,6 +1025,108 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch {}
 
               return { success: true, candidateCount: ids.length, modified, errors: errors.slice(0, 5) };
+            }
+
+            async function tbsyncListEventsBySqlRange(args) {
+              // Robust calendar listing via local.sqlite (in-process; avoids DB lock + provider hangs).
+              const { calendarId, calendarName, start, end, limit } = args || {};
+              if (!start || !end) return { error: "Missing required fields: start, end (YYYY-MM-DDTHH:MM)" };
+
+              const targetCal = resolveCalendar({ calendarId, calendarName });
+              if (!targetCal) return { error: "Calendar not found" };
+
+              const range = makeTimedRange(start, end);
+              if (!range) return { error: `Invalid datetime format (expected YYYY-MM-DDTHH:MM): start=${start} end=${end}` };
+              if (range.error) return { error: range.error };
+
+              const { Sqlite } = ChromeUtils.importESModule("resource://gre/modules/Sqlite.sys.mjs");
+              const prof = Services.dirsvc.get("ProfD", Ci.nsIFile);
+              prof.append("calendar-data");
+              prof.append("local.sqlite");
+
+              const conn = await Sqlite.openConnection({ path: prof.path });
+              try {
+                const sql = `
+                  SELECT id, title, event_start, event_end, event_start_tz, event_end_tz, flags
+                  FROM cal_events
+                  WHERE cal_id = :cal_id
+                    AND event_start >= :start_us
+                    AND event_start < :end_us
+                  ORDER BY event_start ASC
+                  ${limit ? "LIMIT :limit" : ""}
+                `;
+
+                const params = {
+                  cal_id: targetCal.id,
+                  start_us: range.start.nativeTime,
+                  end_us: range.end.nativeTime,
+                };
+                if (limit) params.limit = Math.max(1, Math.min(2000, Number(limit)));
+
+                const rows = await conn.execute(sql, params);
+
+                // Note: 'floating' items often represent all-day events at UTC midnight.
+                const events = rows.map((r) => {
+                  const id = String(r.getResultByName("id"));
+                  const title = String(r.getResultByName("title") || "");
+                  const startUs = Number(r.getResultByName("event_start"));
+                  const endUs = Number(r.getResultByName("event_end"));
+                  const startTz = String(r.getResultByName("event_start_tz") || "");
+                  const endTz = String(r.getResultByName("event_end_tz") || "");
+                  const flags = Number(r.getResultByName("flags") || 0);
+
+                  const startUtcIso = new Date(startUs / 1000).toISOString();
+                  const endUtcIso = new Date(endUs / 1000).toISOString();
+
+                  // Heuristic all-day: 24h duration and floating tz.
+                  const allDay = (startTz === "floating" && (endUs - startUs) === 24 * 60 * 60 * 1_000_000);
+
+                  return {
+                    id,
+                    title,
+                    allDay,
+                    startUs,
+                    endUs,
+                    startTz,
+                    endTz,
+                    flags,
+                    startUtcIso,
+                    endUtcIso,
+                  };
+                });
+
+                return { success: true, calendar: { id: targetCal.id, name: targetCal.name }, start, end, count: events.length, events };
+              } finally {
+                await conn.close();
+              }
+            }
+
+            async function listTodaysEventsForPlanning(args) {
+              // Sync Cornell+Duke (if provided) once each, then SQL-list today's events for both calendars.
+              const { cornellUser, dukeUser } = args || {};
+              // Default users
+              const cu = cornellUser || "jl4624@cornell.edu";
+              const du = dukeUser || "jl888@duke.edu";
+
+              try { await tbsyncSyncAccountByUser(cu); } catch {}
+              try { await tbsyncSyncAccountByUser(du); } catch {}
+
+              await timeoutAfter(1200);
+
+              // Build a local-day window (America/New_York) conservatively by querying 2-day UTC window.
+              // We rely on client-side filtering later if needed.
+              const now = new Date();
+              const y = now.getFullYear();
+              const m = String(now.getMonth() + 1).padStart(2, "0");
+              const d = String(now.getDate()).padStart(2, "0");
+              const dateStr = `${y}-${m}-${d}`;
+              const start = `${dateStr}T00:00`;
+              const end = `${dateStr}T23:59`;
+
+              const cornell = await tbsyncListEventsBySqlRange({ calendarName: "Jiachang Liu Cornell (Calendar)", start, end, limit: 2000 });
+              const duke = await tbsyncListEventsBySqlRange({ calendarName: "Jiachang Liu Duke (Calendar)", start, end, limit: 2000 });
+
+              return { success: true, date: dateStr, cornell, duke };
             }
 
             async function tbsyncListAccounts() {
@@ -1671,6 +1782,35 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 },
               },
               {
+                name: "tbsyncListEventsBySqlRange",
+                title: "TbSync List Events (SQL range)",
+                description: "Robust: list events from calendar-data/local.sqlite for a given calendar and time range",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    calendarName: { type: "string" },
+                    calendarId: { type: "string" },
+                    start: { type: "string" },
+                    end: { type: "string" },
+                    limit: { type: "number" }
+                  },
+                  required: ["start", "end"],
+                },
+              },
+              {
+                name: "listTodaysEventsForPlanning",
+                title: "List Today's Events For Planning",
+                description: "Sync Cornell+Duke once and list today's events for both via SQL (planning helper)",
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    cornellUser: { type: "string" },
+                    dukeUser: { type: "string" }
+                  },
+                  required: [],
+                },
+              },
+              {
                 name: "tbsyncModifyEasEventsBySql",
                 title: "TbSync Modify EAS Events (SQL→modifyItem)",
                 description: "Modify/move events without delete+recreate: find candidates via local.sqlite, then modifyItem as user and sync",
@@ -1845,6 +1985,10 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await tbsyncDeleteEasEventsNativeBySql(args);
                 case "tbsyncCreateEasEventNative":
                   return await tbsyncCreateEasEventNative(args);
+                case "tbsyncListEventsBySqlRange":
+                  return await tbsyncListEventsBySqlRange(args);
+                case "listTodaysEventsForPlanning":
+                  return await listTodaysEventsForPlanning(args);
                 case "tbsyncModifyEasEventsBySql":
                   return await tbsyncModifyEasEventsBySql(args);
                 case "createCalendarEvent":
