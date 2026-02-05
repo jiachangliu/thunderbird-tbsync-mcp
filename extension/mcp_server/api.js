@@ -1453,12 +1453,15 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               const {
                 title,
                 description,
+                location,
                 allDay,
                 // All-day:
                 date,
                 // Timed:
                 start,
                 end,
+                // Reminder (minutes before start). Default behavior: 15 minutes for timed events.
+                reminderMinutes,
                 // Optional short tag placed at end of title.
                 mcpTag,
               } = args || {};
@@ -1487,6 +1490,11 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (description) {
                 ev.setProperty("DESCRIPTION", description);
               }
+              if (location) {
+                try {
+                  ev.setProperty("LOCATION", location);
+                } catch {}
+              }
 
               let range = null;
               if (allDay) {
@@ -1502,6 +1510,23 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               ev.startDate = range.start;
               ev.endDate = range.end;
+
+              // Reminder/alarm support
+              // Default policy: for timed events, set a reminder 15 minutes before start unless overridden.
+              try {
+                if (!allDay) {
+                  const mins = (typeof reminderMinutes === "number") ? reminderMinutes : 15;
+                  if (Number.isFinite(mins) && mins > 0) {
+                    const alarm = Cc["@mozilla.org/calendar/alarm;1"].createInstance(Ci.calIAlarm);
+                    alarm.related = Ci.calIAlarm.ALARM_RELATED_START;
+                    const dur = cal.createDuration();
+                    dur.inSeconds = -Math.round(mins * 60);
+                    alarm.offset = dur;
+                    ev.addAlarm(alarm);
+                    try { ev.setProperty("X-MCP-REMINDER-MINUTES", String(mins)); } catch {}
+                  }
+                }
+              } catch {}
 
               const job = startAddItemJob(target, ev, {
                 kind: "addItem",
@@ -1846,6 +1871,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     date: { type: "string", description: "YYYY-MM-DD (required when allDay=true)" },
                     start: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
                     end: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
+                    location: { type: "string", description: "Optional location" },
+                    reminderMinutes: { type: "number", description: "Minutes before start for reminder (timed events). Default: 15" },
                     mcpTag: { type: "string", description: "Optional short tag appended to title (placed at end)." }
                   },
                   required: ["title", "allDay"],
@@ -1920,6 +1947,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     date: { type: "string", description: "YYYY-MM-DD (required when allDay=true)" },
                     start: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
                     end: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
+                    location: { type: "string", description: "Optional location" },
+                    reminderMinutes: { type: "number", description: "Minutes before start for reminder (timed events). Default: 15" },
                     mcpTag: { type: "string", description: "Optional short tag appended to title (placed at end)." }
                   },
                   required: ["tbsyncUser", "title", "allDay"],
