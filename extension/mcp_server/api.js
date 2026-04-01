@@ -1445,6 +1445,119 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
               return `${base} (${t})`;
             }
 
+            function normalizeMailto(value) {
+              const v = String(value || "").trim();
+              if (!v) return "";
+              return /^mailto:/i.test(v) ? v : `mailto:${v}`;
+            }
+
+            function attendeeEmailKey(spec) {
+              if (typeof spec === "string") {
+                return normalizeMailto(spec).toLowerCase();
+              }
+              const email = spec && (spec.email || spec.id || spec.mailto || "");
+              return normalizeMailto(email).toLowerCase();
+            }
+
+            function buildAttendee(spec, defaults = {}) {
+              const emailOrId = typeof spec === "string"
+                ? spec
+                : (spec && (spec.email || spec.id || spec.mailto || ""));
+              const id = normalizeMailto(emailOrId);
+              if (!id) return null;
+
+              const a = Cc["@mozilla.org/calendar/attendee;1"].createInstance(Ci.calIAttendee);
+              a.id = id;
+
+              const commonName = typeof spec === "object" && spec
+                ? (spec.name || spec.commonName || "")
+                : "";
+              if (commonName) {
+                try { a.commonName = String(commonName); } catch {}
+              }
+
+              const role = (typeof spec === "object" && spec && (spec.role || spec.participationRole)) || defaults.role || "REQ-PARTICIPANT";
+              const partstat = (typeof spec === "object" && spec && (spec.partstat || spec.participationStatus)) || defaults.partstat || "NEEDS-ACTION";
+              const cutype = (typeof spec === "object" && spec && (spec.cutype || spec.userType)) || defaults.cutype || "INDIVIDUAL";
+              const rsvp = (typeof spec === "object" && spec && typeof spec.rsvp === "boolean")
+                ? spec.rsvp
+                : (typeof defaults.rsvp === "boolean" ? defaults.rsvp : undefined);
+
+              try { a.role = String(role); } catch {}
+              try { a.participationStatus = String(partstat); } catch {}
+              try { a.userType = String(cutype); } catch {}
+              if (typeof rsvp === "boolean") {
+                try { a.rsvp = rsvp; } catch {}
+              }
+
+              return a;
+            }
+
+            function attachAttendeesToEvent(ev, args) {
+              const attendees = Array.isArray(args && args.attendees) ? args.attendees : [];
+              const organizerEmail = (args && (args.organizerEmail || args.tbsyncUser)) || "";
+              const organizerName = (args && args.organizerName) || "";
+              const includeSelfAttendee = !!(args && args.includeOrganizerAsAttendee);
+
+              let organizerAttached = false;
+              let attendeeCount = 0;
+              const seen = new Set();
+
+              if (organizerEmail) {
+                const organizer = buildAttendee({
+                  email: organizerEmail,
+                  name: organizerName,
+                  partstat: "NEEDS-ACTION",
+                  cutype: "INDIVIDUAL"
+                }, { role: "CHAIR", partstat: "NEEDS-ACTION", cutype: "INDIVIDUAL" });
+                if (organizer) {
+                  try {
+                    ev.organizer = organizer;
+                    organizerAttached = true;
+                    seen.add(String(organizer.id || "").toLowerCase());
+                  } catch {}
+                }
+              }
+
+              if (includeSelfAttendee && organizerEmail) {
+                const selfAttendee = buildAttendee({
+                  email: organizerEmail,
+                  name: organizerName,
+                  partstat: "NEEDS-ACTION",
+                  rsvp: true
+                }, { role: "REQ-PARTICIPANT", partstat: "NEEDS-ACTION", cutype: "INDIVIDUAL", rsvp: true });
+                if (selfAttendee) {
+                  const key = String(selfAttendee.id || "").toLowerCase();
+                  if (key && !seen.has(key)) {
+                    try {
+                      ev.addAttendee(selfAttendee);
+                      attendeeCount += 1;
+                      seen.add(key);
+                    } catch {}
+                  }
+                }
+              }
+
+              for (const spec of attendees) {
+                const attendee = buildAttendee(spec, {
+                  role: "REQ-PARTICIPANT",
+                  partstat: "NEEDS-ACTION",
+                  cutype: "INDIVIDUAL",
+                  rsvp: true,
+                });
+                if (!attendee) continue;
+                const key = String(attendee.id || "").toLowerCase();
+                if (!key || seen.has(key)) continue;
+                try {
+                  ev.addAttendee(attendee);
+                  attendeeCount += 1;
+                  seen.add(key);
+                } catch {}
+              }
+
+              return { organizerAttached, attendeeCount };
+            }
+
             async function createCalendarEvent(args) {
               if (!cal) {
                 return { error: "Calendar not available" };
@@ -1462,12 +1575,25 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 end,
                 // Reminder (minutes before start). Default behavior: 15 minutes for timed events.
                 reminderMinutes,
+                // Optional attendees / organizer. Attendees are gated behind allowInviteEmails=true.
+                attendees,
+                organizerEmail,
+                organizerName,
+                includeOrganizerAsAttendee,
+                allowInviteEmails,
                 // Optional short tag placed at end of title.
                 mcpTag,
               } = args || {};
 
               if (!title) return { error: "Missing required field: title" };
               if (typeof allDay !== "boolean") return { error: "Missing required field: allDay (boolean)" };
+
+              const attendeeList = Array.isArray(attendees) ? attendees : [];
+              if (attendeeList.length > 0 && allowInviteEmails !== true) {
+                return {
+                  error: "Attendees requested, but allowInviteEmails is not true. Adding attendees may send invitation emails; set allowInviteEmails=true only with explicit user approval.",
+                };
+              }
 
               const target = resolveCalendar(args);
               if (!target) {
@@ -1528,6 +1654,23 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               } catch {}
 
+              let attendeeMeta = { organizerAttached: false, attendeeCount: 0 };
+              if (attendeeList.length > 0 || organizerEmail || organizerName || includeOrganizerAsAttendee) {
+                attendeeMeta = attachAttendeesToEvent(ev, {
+                  attendees: attendeeList,
+                  organizerEmail,
+                  organizerName,
+                  includeOrganizerAsAttendee,
+                  tbsyncUser: (args && args.tbsyncUser) || "",
+                });
+                try {
+                  ev.setProperty("X-MCP-ATTENDEE-COUNT", String(attendeeMeta.attendeeCount));
+                  if (organizerEmail || (args && args.tbsyncUser)) {
+                    ev.setProperty("X-MCP-ORGANIZER", String(organizerEmail || args.tbsyncUser));
+                  }
+                } catch {}
+              }
+
               const job = startAddItemJob(target, ev, {
                 kind: "addItem",
                 calendar: { id: target.id, name: target.name },
@@ -1536,6 +1679,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 date: allDay ? date : undefined,
                 start: !allDay ? range.start.icalString : undefined,
                 end: !allDay ? range.end.icalString : undefined,
+                organizerEmail: organizerEmail || (args && args.tbsyncUser) || undefined,
+                attendeeCount: attendeeMeta.attendeeCount,
               });
 
               return {
@@ -1546,6 +1691,8 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                 date: allDay ? date : undefined,
                 start: !allDay ? range.start.icalString : undefined,
                 end: !allDay ? range.end.icalString : undefined,
+                organizerEmail: organizerEmail || (args && args.tbsyncUser) || null,
+                attendeeCount: attendeeMeta.attendeeCount,
                 pending: job.status === "pending",
                 jobId: job.jobId,
                 itemId: job.itemId || null,
@@ -1567,16 +1714,19 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function idempotencyKey(args) {
-              // calendar + time/date + tag + (for all-day) title to avoid suppressing distinct all-day events on same date.
+              // calendar + time/date + tag + attendee signature + (for all-day) title
               const calKey = (args && (args.calendarId || args.calendarName)) || "";
               const tag = args && args.mcpTag ? String(args.mcpTag).trim() : shortTagForEvent(args);
+              const attendeeSig = Array.isArray(args && args.attendees)
+                ? args.attendees.map(attendeeEmailKey).filter(Boolean).sort().join(',')
+                : "";
               if (args && args.allDay) {
                 const dateKey = String(args.date || "");
                 const titleKey = String(args.title || "");
-                return calKey + '|' + dateKey + '|' + tag + '|' + titleKey;
+                return calKey + '|' + dateKey + '|' + tag + '|' + titleKey + '|' + attendeeSig;
               }
               const timeKey = String(args.start || "") + '-' + String(args.end || "");
-              return calKey + '|' + timeKey + '|' + tag;
+              return calKey + '|' + timeKey + '|' + tag + '|' + attendeeSig;
             }
 
             async function syncAndCreateCalendarEvent(args) {
@@ -1873,6 +2023,25 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     end: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
                     location: { type: "string", description: "Optional location" },
                     reminderMinutes: { type: "number", description: "Minutes before start for reminder (timed events). Default: 15" },
+                    organizerEmail: { type: "string", description: "Optional organizer email. Defaults to tbsyncUser when available." },
+                    organizerName: { type: "string", description: "Optional organizer display name." },
+                    includeOrganizerAsAttendee: { type: "boolean", description: "Optional: also add organizer as an attendee." },
+                    allowInviteEmails: { type: "boolean", description: "MUST be true to attach attendees, since attendee sync may send invitation emails." },
+                    attendees: {
+                      type: "array",
+                      description: "Optional attendees. Requires allowInviteEmails=true.",
+                      items: {
+                        type: "object",
+                        properties: {
+                          email: { type: "string" },
+                          name: { type: "string" },
+                          role: { type: "string", description: "e.g. REQ-PARTICIPANT, OPT-PARTICIPANT" },
+                          partstat: { type: "string", description: "e.g. NEEDS-ACTION, ACCEPTED" },
+                          rsvp: { type: "boolean" }
+                        },
+                        required: ["email"]
+                      }
+                    },
                     mcpTag: { type: "string", description: "Optional short tag appended to title (placed at end)." }
                   },
                   required: ["title", "allDay"],
@@ -1949,6 +2118,25 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
                     end: { type: "string", description: "YYYY-MM-DDTHH:MM (required when allDay=false)" },
                     location: { type: "string", description: "Optional location" },
                     reminderMinutes: { type: "number", description: "Minutes before start for reminder (timed events). Default: 15" },
+                    organizerEmail: { type: "string", description: "Optional organizer email. Defaults to tbsyncUser when available." },
+                    organizerName: { type: "string", description: "Optional organizer display name." },
+                    includeOrganizerAsAttendee: { type: "boolean", description: "Optional: also add organizer as an attendee." },
+                    allowInviteEmails: { type: "boolean", description: "MUST be true to attach attendees, since attendee sync may send invitation emails." },
+                    attendees: {
+                      type: "array",
+                      description: "Optional attendees. Requires allowInviteEmails=true.",
+                      items: {
+                        type: "object",
+                        properties: {
+                          email: { type: "string" },
+                          name: { type: "string" },
+                          role: { type: "string", description: "e.g. REQ-PARTICIPANT, OPT-PARTICIPANT" },
+                          partstat: { type: "string", description: "e.g. NEEDS-ACTION, ACCEPTED" },
+                          rsvp: { type: "boolean" }
+                        },
+                        required: ["email"]
+                      }
+                    },
                     mcpTag: { type: "string", description: "Optional short tag appended to title (placed at end)." }
                   },
                   required: ["tbsyncUser", "title", "allDay"],
