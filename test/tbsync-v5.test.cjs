@@ -37,6 +37,7 @@ const refusal = (reply, pattern) => {
 async function fixture(t, override = {}) {
   const responses = {
     status: grant,
+    getState: { accounts: [{ accountId: grant.target.accountId, provider: "eas" }] },
     "calendars.get": calendar,
     "items.query": [event],
     getFolders: { folders: [folder] },
@@ -115,10 +116,11 @@ test("reads iCalendar from the granted account, converting offsets to the native
   const result = unpack(await read(handle, "listCalendarEvents", { ...range, calendarId: calendar.id, limit: 1 }));
   assert.deepEqual(result, { calendar, ...range, count: 1, truncated: true,
     events: [{ id: event.id, instance: event.instance, ical: event.item }] });
-  assert.deepEqual(calls.map(call => call.body.cmd), ["status", "calendars.get", "items.query", "status"]);
+  assert.deepEqual(calls.map(call => call.body.cmd), ["status", "getState", "calendars.get", "getFolders", "items.query", "status"]);
   assert.ok(calls.every(call => call.method === "POST" && call.path === "/rpc" && call.auth === "Bearer tbsync"));
-  assert.deepEqual(calls[2].body.args, {
-    accountId: "42", resource: "calendars", type: "event", expand: true,
+  const query = calls.find(call => call.body.cmd === "items.query").body.args;
+  assert.deepEqual(query, {
+    resource: "calendars", type: "event", expand: true,
     rangeStart: "20261108T140000Z", rangeEnd: "20261108T150000Z",
   });
 });
@@ -166,7 +168,7 @@ test("rejects scope overrides and ambiguous or excessive ranges before querying 
   }
   assert.deepEqual(calls, []);
   refusal(await read(handle, "listCalendarEvents", { ...range, calendarId: "other" }), /outside/);
-  assert.deepEqual(calls.map(call => call.body.cmd), ["status", "calendars.get"]);
+  assert.deepEqual(calls.map(call => call.body.cmd), ["status", "getState", "calendars.get", "getFolders"]);
 });
 
 test("discards mismatched results and results whose grant changed in flight", async t => {
@@ -179,7 +181,7 @@ test("discards mismatched results and results whose grant changed in flight", as
     return { ...grant, resources: { calendars: { ...grant.resources.calendars, folderId: "different" } } };
   } });
   refusal(await read(changed.handle, "listCalendarEvents", range), /grant changed/);
-  assert.deepEqual(changed.calls.map(call => call.body.cmd), ["status", "calendars.get", "items.query", "status"]);
+  assert.deepEqual(changed.calls.map(call => call.body.cmd), ["status", "getState", "calendars.get", "getFolders", "items.query", "status"]);
 });
 
 test("an unavailable EAS queue is unknown and an oversized helper response fails closed", async t => {
@@ -190,4 +192,42 @@ test("an unavailable EAS queue is unknown and an oversized helper response fails
 
   const oversized = await fixture(t, { "items.query": [{ ...event, item: "x".repeat(2 * 1024 * 1024) }] });
   refusal(await read(oversized.handle, "listCalendarEvents", range), /exceeded 2 MiB/);
+});
+
+const scopedReads = [
+  ["tbsyncGetSyncStatus"],
+  ["listCalendars"],
+  ["listEvents", range],
+  ["listCalendarEvents", range],
+];
+
+test("all read verbs accept a storage calendar with a matching EAS folder binding", async t => {
+  const storageCalendar = { ...calendar, type: "storage", readOnly: true };
+  const { handle } = await fixture(t, { "calendars.get": storageCalendar });
+  for (const [name, args] of scopedReads) {
+    const reply = await read(handle, name, args);
+    assert.equal(reply.result.isError, undefined, name);
+    const result = unpack(reply);
+    assert.deepEqual(name === "listCalendars" ? result[0] : result.calendar, storageCalendar, name);
+  }
+});
+
+test("all read verbs refuse a storage calendar with a mismatched folder target ID", async t => {
+  const { calls, handle } = await fixture(t, {
+    "calendars.get": { ...calendar, type: "storage" },
+    getFolders: { folders: [{ ...folder, targetID: "different-calendar" }] },
+  });
+  for (const [name, args] of scopedReads) {
+    refusal(await read(handle, name, args), /granted calendar binding changed/i);
+  }
+  assert.ok(!calls.some(({ body }) => ["items.query", "getChangelog"].includes(body.cmd)));
+});
+
+test("an EAS account elsewhere in the snapshot cannot authorize the granted non-EAS account", async t => {
+  const { calls, handle } = await fixture(t, {
+    getState: { accounts: [{ accountId: grant.target.accountId, provider: "dav" },
+      { accountId: "other", provider: "eas" }] },
+  });
+  refusal(await read(handle, "listCalendars"), /granted TbSync account is not an EAS account/);
+  assert.deepEqual(calls.map(call => call.body.cmd), ["status", "getState"]);
 });

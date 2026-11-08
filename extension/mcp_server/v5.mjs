@@ -7,7 +7,6 @@ const HELPER_VERSION = 2;
 const SYNC_TIMEOUT_MS = 90000;
 const CALENDAR_SYNC_TIMEOUT_MS = 60000;
 const MAX_RANGE_MS = 31 * 86400000;
-const EAS_CALENDAR_TYPE = "ext-eas4tbsync@jobisoft.de";
 
 const noArgs = { type: "object", properties: {}, additionalProperties: false };
 const readTools = [
@@ -115,12 +114,22 @@ async function getGrant(rpc) {
 }
 
 async function getCalendar(rpc, grant) {
-  const calendar = await rpc("calendars.get", { accountId: grant.accountId, resource: "calendars" });
-  if (!nonEmptyString(calendar?.id) || calendar.type !== EAS_CALENDAR_TYPE) {
-    throw new Error("The granted folder does not resolve to an EAS calendar.");
+  const { accounts } = await rpc("getState") ?? {};
+  const account = Array.isArray(accounts) ? accounts.find(row => row?.accountId === grant.accountId) : null;
+  if (account?.provider !== "eas") {
+    throw new Error("The granted TbSync account is not an EAS account.");
   }
-  const { id, name, type, readOnly, enabled } = calendar;
-  return { id, name, type, readOnly, enabled };
+
+  const platform = await rpc("calendars.get", { accountId: grant.accountId, resource: "calendars" });
+  if (!nonEmptyString(platform?.id)) {
+    throw new Error("The granted folder does not resolve to a calendar.");
+  }
+  // Thunderbird can expose a bound EAS calendar as storage. The TbSync
+  // account provider and the folder's target ID identify the binding.
+  const { id, name, type, readOnly, enabled } = platform;
+  const calendar = { id, name, type, readOnly, enabled };
+  const folder = await readFolder(rpc, grant, calendar);
+  return { calendar, folder };
 }
 
 async function assertSameGrant(rpc, grant) {
@@ -154,11 +163,8 @@ async function readQueue(rpc, { accountId, folderId }, eventId) {
   };
 }
 
-async function getSyncStatus(rpc, grant, calendar) {
-  const [folder, queue] = await Promise.all([
-    readFolder(rpc, grant, calendar),
-    readQueue(rpc, grant).catch(() => ({ pendingChanges: null, pendingCalendarMessages: null })),
-  ]);
+async function getSyncStatus(rpc, grant, calendar, folder) {
+  const queue = await readQueue(rpc, grant).catch(() => ({ pendingChanges: null, pendingCalendarMessages: null }));
   const lastSyncTime = Number.isFinite(folder.lastSyncTime) && folder.lastSyncTime > 0
     ? folder.lastSyncTime : null;
   return { ...grant, calendar, status: folder.status ?? null, lastSyncTime, ...queue };
@@ -166,7 +172,7 @@ async function getSyncStatus(rpc, grant, calendar) {
 
 async function requireCapabilities(rpc, mutation) {
   const required = new Map([
-    ["getFolders", null], ["calendars.get", "calendar"],
+    ["getState", null], ["getFolders", null], ["calendars.get", "calendar"],
     mutation ? ["calendars.synchronize", "calendar"] : ["syncAccount", "account"],
   ]);
   if (mutation) {
@@ -264,8 +270,7 @@ async function runEventWorkflow(rpc, eventCodec, command, args, grant, calendar,
   // Upstream resolves its calendar grant per call. Check the binding again
   // immediately before the write, and validate the reply and readback.
   await assertSameGrant(rpc, grant);
-  const current = await getCalendar(rpc, grant);
-  const binding = await readFolder(rpc, grant, calendar);
+  const { calendar: current, folder: binding } = await getCalendar(rpc, grant);
   if (current.id !== calendar.id || current.readOnly !== false || current.enabled !== true ||
       binding.readOnly === true || binding.downloadOnly === true) {
     throw new Error("The granted calendar changed or stopped accepting writes.");
@@ -327,11 +332,13 @@ function eventQuery(args) {
   return { type: "event", expand: true, rangeStart: toICal(start), rangeEnd: toICal(end) };
 }
 
-async function listEvents(rpc, grant, calendar, args, query) {
+async function listEvents(rpc, calendar, args, query) {
   if (args.calendarId !== undefined && args.calendarId !== calendar.id) {
     throw new Error("The requested calendar is outside the TbSync Bridge grant.");
   }
-  const events = await rpc("items.query", { ...query, accountId: grant.accountId, resource: "calendars" });
+  // The helper injects its granted calendar ID and forwards other options
+  // to Thunderbird's query schema, which rejects accountId.
+  const events = await rpc("items.query", { ...query, resource: "calendars" });
   if (!Array.isArray(events) || events.some(event => event?.calendarId !== calendar.id ||
     event.type !== "event" || event.format !== "ical" || typeof event.item !== "string" ||
     !nonEmptyString(event.id))) {
@@ -385,7 +392,7 @@ export function createV5Handler(rpc, { eventCodec, wait } = {}) {
           throw new Error("Select a bound EAS calendar for the requested account in the TbSync Bridge tab.");
         }
         await requireCapabilities(rpc, command);
-        const calendar = await getCalendar(rpc, grant);
+        const { calendar } = await getCalendar(rpc, grant);
         if (syncing) {
           const sync = await confirmedSync(rpc, grant, calendar);
           return { success: true, accountID: grant.accountId, calendar, ...sync };
@@ -411,11 +418,11 @@ export function createV5Handler(rpc, { eventCodec, wait } = {}) {
       throw new Error("Select a bound EAS calendar in the TbSync Bridge tab.");
     }
 
-    const calendar = await getCalendar(rpc, grant);
+    const { calendar, folder } = await getCalendar(rpc, grant);
     let result;
-    if (name === "tbsyncGetSyncStatus") result = await getSyncStatus(rpc, grant, calendar);
+    if (name === "tbsyncGetSyncStatus") result = await getSyncStatus(rpc, grant, calendar, folder);
     else if (name === "listCalendars") result = [calendar];
-    else result = await listEvents(rpc, grant, calendar, args, query);
+    else result = await listEvents(rpc, calendar, args, query);
     await assertSameGrant(rpc, grant);
     return result;
   }
@@ -438,7 +445,7 @@ export function createV5Handler(rpc, { eventCodec, wait } = {}) {
         return { ...reply, result: {
           protocolVersion,
           capabilities: { tools: {} },
-          serverInfo: { name: "thunderbird-tbsync-mcp", version: "0.11.0" },
+          serverInfo: { name: "thunderbird-tbsync-mcp", version: "0.11.1" },
         } };
       }
       case "ping":

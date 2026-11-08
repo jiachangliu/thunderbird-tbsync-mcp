@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
 const scope = { accountID: "42", calendarId: "calendar", confirm: true };
-const calendar = { id: scope.calendarId, name: "Test calendar", type: "ext-eas4tbsync@jobisoft.de",
+const calendar = { id: scope.calendarId, name: "Test calendar", type: "storage",
   enabled: true, readOnly: false };
 const grant = {
   helperVersion: 2, unrestricted: false,
@@ -13,7 +13,7 @@ const grant = {
     bound: true, selected: true, targetType: "calendars" } },
 };
 const capabilities = [
-  ["getFolders", null], ["syncAccount", "account"], ["calendars.get", "calendar"],
+  ["getState", null], ["getFolders", null], ["syncAccount", "account"], ["calendars.get", "calendar"],
   ["calendars.synchronize", "calendar"], ["getChangelog", "folder"], ["items.get", "calendar"],
   ["items.create", "calendar"], ["items.update", "calendar"], ["items.remove", "calendar"],
 ].map(([cmd, scope]) => ({ cmd, scope }));
@@ -24,7 +24,7 @@ async function fixture(options = {}) {
   const { createV5Handler } = await import("../extension/mcp_server/v5.mjs");
   const calls = [];
   const events = new Map(options.events ?? []);
-  const folder = { accountId: scope.accountID, folderId: "f-7", targetID: calendar.id, selected: true,
+  const folder = { accountId: scope.accountID, folderId: "f-7", targetID: options.targetID ?? calendar.id, selected: true,
     targetType: "calendars", status: "success", lastSyncTime: 100 };
   let queue = options.queue ?? [];
   const result = (id, item) => ({ id, item, calendarId: calendar.id, type: "event", format: "ical" });
@@ -38,8 +38,10 @@ async function fixture(options = {}) {
         return options.grant?.(state) ?? grant;
       case "help":
         return { commands: options.capabilities ?? capabilities };
+      case "getState":
+        return { accounts: [{ accountId: scope.accountID, provider: "eas" }] };
       case "calendars.get":
-        return calendar;
+        return { ...calendar, readOnly: options.readOnly ?? calendar.readOnly };
       case "getFolders": {
         if (nextFolderStatus) {
           folder.status = nextFolderStatus.shift();
@@ -208,4 +210,30 @@ test("an unexpected calendar message blocks the explicit post-sync", async () =>
   assert.equal(result.postSync, null);
   assert.match(result.error, /post-sync was withheld/);
   assert.equal(names(runtime).filter(cmd => cmd === "calendars.synchronize").length, 1);
+});
+
+const writeCalls = [
+  ["createCalendarEvent", createArgs],
+  ["updateCalendarEvent", editArgs],
+  ["deleteCalendarEvent", { ...scope, eventId: editArgs.eventId, expectedIcal: editArgs.expectedIcal }],
+];
+
+test("sync and writes refuse a storage calendar with a mismatched folder target ID", async () => {
+  const runtime = await fixture({ targetID: "different-calendar" });
+  for (const [name, args] of [["tbsyncSyncAccount", scopeForAccount()], ...writeCalls]) {
+    assert.match((await call(runtime, name, args)).error, /granted calendar binding changed/i, name);
+  }
+  assert.ok(!names(runtime).some(cmd => ["syncAccount", "calendars.synchronize",
+    "items.create", "items.update", "items.remove"].includes(cmd)));
+});
+
+test("a bound read-only storage calendar permits account sync and refuses all writes", async () => {
+  const runtime = await fixture({ readOnly: true });
+  assert.equal((await call(runtime, "tbsyncSyncAccount", scopeForAccount())).success, true);
+  runtime.calls.length = 0;
+  for (const [name, args] of writeCalls) {
+    assert.match((await call(runtime, name, args)).error, /read-only/, name);
+  }
+  assert.ok(!names(runtime).some(cmd => ["syncAccount", "calendars.synchronize",
+    "items.create", "items.update", "items.remove"].includes(cmd)));
 });
