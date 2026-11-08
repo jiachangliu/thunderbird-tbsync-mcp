@@ -25,7 +25,7 @@ async function fixture(options = {}) {
   const calls = [];
   const events = new Map(options.events ?? []);
   const folder = { accountId: scope.accountID, folderId: "f-7", targetID: options.targetID ?? calendar.id, selected: true,
-    targetType: "calendars", status: "success", lastSyncTime: 100 };
+    targetType: "calendars", status: options.folderStatus ?? "success", lastSyncTime: 100 };
   let queue = options.queue ?? [];
   const result = (id, item) => ({ id, item, calendarId: calendar.id, type: "event", format: "ical" });
   let refreshes = 0;
@@ -39,7 +39,8 @@ async function fixture(options = {}) {
       case "help":
         return { commands: options.capabilities ?? capabilities };
       case "getState":
-        return { accounts: [{ accountId: scope.accountID, provider: "eas" }] };
+        return { accounts: [{ accountId: scope.accountID, provider: "eas", enabled: true, ...options.account }],
+          transient: options.transient };
       case "calendars.get":
         return { ...calendar, readOnly: options.readOnly ?? calendar.readOnly };
       case "getFolders": {
@@ -64,7 +65,7 @@ async function fixture(options = {}) {
         return null;
       case "syncAccount":
         if (!options.accountNoop) folder.lastSyncTime++;
-        return { folders: [{ ...folder }] };
+        return { folders: [{ ...folder, ...options.completed }] };
       case "items.get":
         return events.has(args.id) ? result(args.id, events.get(args.id)) : null;
       case "items.create":
@@ -120,13 +121,49 @@ test("returns only the granted account and refuses writes without confirmation o
   assert.deepEqual(names(missing), ["status", "help"]);
 });
 
-test("manual account sync requires fresh success for the granted calendar", async () => {
+test("manual account sync reports a fresh successful folder timestamp", async () => {
   const good = await fixture();
   assert.equal((await call(good, "tbsyncSyncAccount", scopeForAccount())).lastSyncTime, 101);
   assert.equal(good.calls.find(call => call.cmd === "syncAccount").timeout, 90000);
+});
 
-  const stalled = await fixture({ accountNoop: true });
-  assert.match((await call(stalled, "tbsyncSyncAccount", scopeForAccount())).error, /fresh successful sync/);
+test("manual account sync can confirm an unchanged successful folder with empty queues", async () => {
+  for (const migrationPending of [false, true]) {
+    const runtime = await fixture({ accountNoop: true, account: {
+      legacyImported: migrationPending, legacyReplayPending: migrationPending,
+    } });
+    assert.deepEqual(await call(runtime, "tbsyncSyncAccount", scopeForAccount()), {
+      success: true, accountID: scope.accountID, calendar, status: "success", lastSyncTime: 100,
+      outcome: "unchanged", migrationPending, pendingChanges: 0, pendingCalendarMessages: 0,
+    });
+    assert.equal(names(runtime).filter(cmd => cmd === "syncAccount").length, 1);
+    assert.ok(!names(runtime).includes("calendars.synchronize"));
+  }
+});
+
+test("manual account sync refuses an unbound calendar or an inconclusive sync result", async () => {
+  const unbound = await fixture({ grant: () => ({ ...grant, resources: {
+    calendars: { ...grant.resources.calendars, bound: false },
+  } }) });
+  assert.match((await call(unbound, "tbsyncSyncAccount", scopeForAccount())).error, /bound EAS calendar/);
+  assert.ok(!names(unbound).includes("syncAccount"));
+
+  for (const [options, expected] of [
+    [{ folderStatus: "error" }, /did not confirm a successful sync/],
+    [{ completed: { status: "pending" } }, /did not confirm a successful sync/],
+    [{ completed: { lastSyncTime: 99 } }, /did not confirm a successful sync/],
+    [{ queue: [{ status: "modified_by_user" }] }, /pending calendar work/],
+    [{ queue: [{ status: "modified_for_sendMail" }] }, /pending calendar work/],
+    [{ queueError: true }, /queue unavailable/],
+    [{ account: { enabled: false } }, /disabled or has an error/],
+    [{ account: { error: "E:AUTH" } }, /disabled or has an error/],
+    [{ transient: { syncingAccounts: [scope.accountID] } }, /account is busy/],
+  ]) {
+    const runtime = await fixture({ accountNoop: true, ...options });
+    const result = await call(runtime, "tbsyncSyncAccount", scopeForAccount());
+    assert.equal(result.isError, true, JSON.stringify(options));
+    assert.match(result.error, expected);
+  }
 });
 
 function scopeForAccount() {

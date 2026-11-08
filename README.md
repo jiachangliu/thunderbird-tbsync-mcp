@@ -37,8 +37,10 @@ and write workflows. Keep the Bridge grant fixed until a request finishes.
   need an explicit UTC offset or `Z` and are limited to 31 days.
   `listCalendarEvents` is an alias.
 - `tbsyncSyncAccount` explicitly syncs the granted account, including its
-  selected folders. It requires `accountID` and `confirm: true`, and
-  checks that the granted calendar records a fresh successful sync.
+  selected folders. It requires `accountID` and `confirm: true`. If TbSync
+  reports an unchanged successful timestamp with no queued calendar work,
+  the result includes `outcome: "unchanged"` and `migrationPending`. That
+  confirms the observed state without claiming a new Exchange refresh.
 - `createCalendarEvent`, `updateCalendarEvent`, and `deleteCalendarEvent`
   require `accountID`, `calendarId`, and explicit `confirm: true`. The
   workflow verifies one scoped refresh before the local edit and one

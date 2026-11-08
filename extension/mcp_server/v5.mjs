@@ -76,7 +76,7 @@ const mutationCommands = new Map([
   ["deleteCalendarEvent", "items.remove"],
 ]);
 const writeTools = [
-  tool("tbsyncSyncAccount", "Explicitly sync the granted EAS account and verify the granted calendar advanced.",
+  tool("tbsyncSyncAccount", "Sync the granted EAS account and report a fresh or unchanged successful calendar status.",
     confirmation, ["accountID", "confirm"]),
   tool("createCalendarEvent", "Create a tagged standalone event with a confirmed pre-sync and post-sync.",
     { ...target, ...eventFields }, [...Object.keys(target), "title", "mcpTag", "allDay"]),
@@ -113,9 +113,12 @@ async function getGrant(rpc) {
   };
 }
 
+function findAccount(state, accountId) {
+  return Array.isArray(state?.accounts) ? state.accounts.find(row => row?.accountId === accountId) : null;
+}
+
 async function getCalendar(rpc, grant) {
-  const { accounts } = await rpc("getState") ?? {};
-  const account = Array.isArray(accounts) ? accounts.find(row => row?.accountId === grant.accountId) : null;
+  const account = findAccount(await rpc("getState"), grant.accountId);
   if (account?.provider !== "eas") {
     throw new Error("The granted TbSync account is not an EAS account.");
   }
@@ -187,43 +190,77 @@ async function requireCapabilities(rpc, mutation) {
   }
 }
 
-function isFreshSync(folder, before) {
+function hasSuccessfulSync(folder) {
   return folder?.selected === true && folder.status === "success" &&
-    Number.isFinite(folder.lastSyncTime) && folder.lastSyncTime > (before.lastSyncTime ?? 0);
+    !folder.error && Number.isFinite(folder.lastSyncTime) && folder.lastSyncTime > 0;
 }
 
-async function confirmedSync(rpc, grant, calendar, wait) {
+function isFreshSync(folder, before) {
+  return hasSuccessfulSync(folder) && folder.lastSyncTime > (before.lastSyncTime ?? 0);
+}
+
+async function confirmedAccountSync(rpc, grant, calendar) {
   await assertSameGrant(rpc, grant);
   const before = await readFolder(rpc, grant, calendar);
-  if (wait) {
-    // The scoped refresh returns when scheduled. Require the host's folder
-    // state to confirm completion before advancing to the next stage.
-    await rpc("calendars.synchronize", { accountId: grant.accountId, resource: "calendars" });
-    const deadline = Date.now() + CALENDAR_SYNC_TIMEOUT_MS;
-    let observedPending = false;
-    do {
-      const current = await readFolder(rpc, grant, calendar);
-      if (isFreshSync(current, before)) {
-        await assertSameGrant(rpc, grant);
-        return { status: "success", lastSyncTime: current.lastSyncTime };
-      }
-      observedPending ||= current.status === "pending";
-      if ((observedPending && ["error", "aborted", "warning"].includes(current.status)) ||
-          (current.status === "warning" && current.lastSyncTime > (before.lastSyncTime ?? 0))) break;
-      await wait(750);
-    } while (Date.now() < deadline);
-  } else {
-    const result = await rpc("syncAccount", { accountId: grant.accountId }, SYNC_TIMEOUT_MS);
-    const completed = Array.isArray(result?.folders)
-      ? result.folders.find(folder => folder?.folderId === grant.folderId) : null;
-    if (isFreshSync(completed, before)) {
-      await assertSameGrant(rpc, grant);
-      const current = await readFolder(rpc, grant, calendar);
-      if (isFreshSync(current, before) && current.lastSyncTime >= completed.lastSyncTime) {
-        return { status: "success", lastSyncTime: current.lastSyncTime };
-      }
+  const result = await rpc("syncAccount", { accountId: grant.accountId }, SYNC_TIMEOUT_MS);
+  const completed = Array.isArray(result?.folders)
+    ? result.folders.find(folder => folder?.folderId === grant.folderId) : null;
+  const failure = "TbSync did not confirm a successful sync for the granted calendar. Check TbSync Manager.";
+  if (!hasSuccessfulSync(completed)) throw new Error(failure);
+
+  const fresh = isFreshSync(completed, before);
+  let unchanged;
+  if (!fresh) {
+    if (!hasSuccessfulSync(before) || before.lastSyncTime !== completed.lastSyncTime) throw new Error(failure);
+    const queue = await readQueue(rpc, grant);
+    if (queue.pendingChanges || queue.pendingCalendarMessages) {
+      throw new Error("TbSync reported pending calendar work without a fresh successful sync. Check TbSync Manager.");
     }
+    const state = await rpc("getState");
+    const account = findAccount(state, grant.accountId);
+    if (account?.enabled !== true || account.error) {
+      throw new Error("The TbSync account is disabled or has an error. Check TbSync Manager.");
+    }
+    if (["syncingAccounts", "cancellingAccounts", "maintainingAccounts", "settingUpAccounts", "upgradeAccounts"]
+      .some(key => state.transient?.[key]?.includes(grant.accountId))) {
+      throw new Error("The TbSync account is busy. Try again after the current operation completes.");
+    }
+    // The bridge can return without contacting Exchange, including while a
+    // legacy migration is pending. Confirm only the observed folder state.
+    unchanged = {
+      outcome: "unchanged",
+      migrationPending: account.legacyImported === true || account.legacyReplayPending === true,
+      ...queue,
+    };
   }
+
+  await assertSameGrant(rpc, grant);
+  const current = await readFolder(rpc, grant, calendar);
+  const consistent = fresh ? current.lastSyncTime >= completed.lastSyncTime
+    : current.lastSyncTime === completed.lastSyncTime;
+  if (!hasSuccessfulSync(current) || !consistent) throw new Error(failure);
+  return { status: "success", lastSyncTime: current.lastSyncTime, ...unchanged };
+}
+
+async function confirmedCalendarRefresh(rpc, grant, calendar, wait) {
+  await assertSameGrant(rpc, grant);
+  const before = await readFolder(rpc, grant, calendar);
+  // The scoped refresh returns when scheduled. Require the host's folder
+  // state to confirm completion before advancing to the next stage.
+  await rpc("calendars.synchronize", { accountId: grant.accountId, resource: "calendars" });
+  const deadline = Date.now() + CALENDAR_SYNC_TIMEOUT_MS;
+  let observedPending = false;
+  do {
+    const current = await readFolder(rpc, grant, calendar);
+    if (isFreshSync(current, before)) {
+      await assertSameGrant(rpc, grant);
+      return { status: "success", lastSyncTime: current.lastSyncTime };
+    }
+    observedPending ||= current.status === "pending";
+    if ((observedPending && ["error", "aborted", "warning"].includes(current.status)) ||
+        (current.status === "warning" && current.lastSyncTime > (before.lastSyncTime ?? 0))) break;
+    await wait(750);
+  } while (Date.now() < deadline);
   throw new Error("TbSync did not confirm a fresh successful sync for the granted calendar. Check TbSync Manager.");
 }
 
@@ -250,7 +287,7 @@ async function runEventWorkflow(rpc, eventCodec, command, args, grant, calendar,
   const deleting = command === "items.remove";
   const eventId = creating ? eventCodec.idForTag(args.mcpTag) : args.eventId;
   await requireQuietQueue(rpc, grant);
-  const preSync = await confirmedSync(rpc, grant, calendar, wait);
+  const preSync = await confirmedCalendarRefresh(rpc, grant, calendar, wait);
   await requireQuietQueue(rpc, grant);
   const original = await readEvent(rpc, scope, calendar, eventId);
   if (creating && original !== null) {
@@ -301,7 +338,7 @@ async function runEventWorkflow(rpc, eventCodec, command, args, grant, calendar,
     if (queued.pendingCalendarMessages || queued.unrelatedPending) {
       throw new Error("The calendar queued other edits or calendar messages. The explicit post-sync was withheld.");
     }
-    postSync = await confirmedSync(rpc, grant, calendar, wait);
+    postSync = await confirmedCalendarRefresh(rpc, grant, calendar, wait);
     const after = await readQueue(rpc, grant);
     const stored = await readEvent(rpc, scope, calendar, eventId);
     await assertSameGrant(rpc, grant);
@@ -394,7 +431,7 @@ export function createV5Handler(rpc, { eventCodec, wait } = {}) {
         await requireCapabilities(rpc, command);
         const { calendar } = await getCalendar(rpc, grant);
         if (syncing) {
-          const sync = await confirmedSync(rpc, grant, calendar);
+          const sync = await confirmedAccountSync(rpc, grant, calendar);
           return { success: true, accountID: grant.accountId, calendar, ...sync };
         }
         if (calendar.id !== args.calendarId || calendar.readOnly !== false || calendar.enabled !== true) {
@@ -445,7 +482,7 @@ export function createV5Handler(rpc, { eventCodec, wait } = {}) {
         return { ...reply, result: {
           protocolVersion,
           capabilities: { tools: {} },
-          serverInfo: { name: "thunderbird-tbsync-mcp", version: "0.11.1" },
+          serverInfo: { name: "thunderbird-tbsync-mcp", version: "0.11.2" },
         } };
       }
       case "ping":
