@@ -35,9 +35,41 @@ MCP Client <--stdio--> mcp-bridge.cjs <--HTTP--> Thunderbird Extension (localhos
 
 If TbSync (or the EAS provider) is not installed, tools will return a clear error.
 
-## Tools
+## TbSync 5.x read-only backend
 
-Implemented tools are exposed via JSON-RPC on `http://localhost:8766`.
+The stdio bridge supports an opt-in backend for Thunderbird 153 ESR with
+TbSync 5.3.x **beta** and EAS-4-TbSync 5.3.x. This backend uses TbSync's native
+helper protocol 2. It does not use this project's legacy XPI or HTTP server.
+
+In a test profile, use the TbSync Manager's Bridge tab with the matching
+native helper, keep unrestricted mode off, and grant one EAS calendar.
+Set `TBSYNC_MCP_BACKEND=v5` in your MCP client's environment and point the
+client to `mcp-bridge.cjs` in this checkout. The helper listens on
+`127.0.0.1:47654` by default. Its static bearer header protects against
+simple cross-origin browser requests. Local processes can still reach
+the helper while it is enabled.
+
+- `tbsyncGetSyncStatus` reports the binding and last recorded sync, with counts
+  for unpushed edits and queued calendar messages. A `null` count means the
+  provider queue was unavailable. This call never requests a sync.
+- `listCalendars` returns the one granted EAS calendar.
+- `listCalendarEvents` takes `start` and `end` with an explicit timezone offset
+  or `Z`. It returns iCalendar records and expanded recurrence instances for
+  up to 31 days. The optional `calendarId` must match the grant. Results are
+  capped at 50 by default and at 100 when requested, with a `truncated` flag.
+
+V5 MCP writes and manual sync remain gated on live Outlook validation.
+Use a disposable Thunderbird profile and a dedicated test calendar for
+that validation. For one tagged event with no attendees, verify create,
+edit, and delete in the provider queue and independently in Outlook.
+Check that a repeated request creates no duplicates and that no calendar
+messages were queued. The repository's normal build still packages the
+legacy extension. Run `node --test` to check the v5 stdio backend offline.
+
+## Legacy tools
+
+Legacy mode remains the default. Its tools use JSON-RPC on
+`http://localhost:8766`.
 
 - `tbsyncListAccounts`
 - `tbsyncSyncAccount` (by TbSync account ID)

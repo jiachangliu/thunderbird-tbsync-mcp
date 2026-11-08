@@ -3,7 +3,8 @@
 /**
  * MCP stdio <-> HTTP bridge for thunderbird-tbsync-mcp.
  *
- * The Thunderbird extension listens on localhost:8766.
+ * Legacy mode uses the Thunderbird extension on localhost:8766.
+ * V5 mode uses the scoped TbSync beta native helper.
  */
 
 const http = require("http");
@@ -43,6 +44,16 @@ function postJson(payload) {
   });
 }
 
+const backend = process.env.TBSYNC_MCP_BACKEND ?? "legacy";
+if (backend !== "legacy" && backend !== "v5") {
+  process.stderr.write("TBSYNC_MCP_BACKEND must be legacy or v5.\n");
+  process.exit(1);
+}
+const dispatch = backend === "v5"
+  ? require("./tbsync-v5.cjs").createV5Handler(
+    process.env.TBSYNC_V5_PORT === undefined ? undefined : Number(process.env.TBSYNC_V5_PORT))
+  : postJson;
+
 let buffer = "";
 process.stdin.setEncoding("utf8");
 
@@ -68,8 +79,10 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
 
-    postJson(msg)
-      .then((resp) => process.stdout.write(JSON.stringify(resp) + "\n"))
+    dispatch(msg)
+      .then(resp => {
+        if (resp !== null) process.stdout.write(JSON.stringify(resp) + "\n");
+      })
       .catch((err) => {
         process.stdout.write(
           JSON.stringify({
