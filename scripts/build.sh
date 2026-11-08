@@ -11,6 +11,7 @@ DIST_DIR="$PROJECT_DIR/dist"
 echo "Building Thunderbird TbSync MCP extension..."
 
 mkdir -p "$DIST_DIR"
+rm -f -- "$DIST_DIR/thunderbird-tbsync-mcp.xpi"
 
 cd "$EXTENSION_DIR"
 zip -r "$DIST_DIR/thunderbird-tbsync-mcp.xpi" . -x "*.DS_Store" -x "*.git*"

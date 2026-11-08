@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const { once } = require("node:events");
 const http = require("node:http");
+const fs = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
 const { createV5Handler } = require("../tbsync-v5.cjs");
@@ -17,7 +19,7 @@ const grant = {
       bound: true, targetType: "calendars" },
   },
 };
-const calendar = { id: "cal-7", name: "Test calendar", type: "ext-eas4tbsync@jobisoft.de", readOnly: false };
+const calendar = { id: "cal-7", name: "Test calendar", type: "ext-eas4tbsync@jobisoft.de", readOnly: false, enabled: true };
 const folder = { accountId: "42", folderId: "f-7", targetID: calendar.id, selected: true,
   targetType: "calendars", status: "ok", lastSyncTime: 1794150000000 };
 const event = { id: "uid-1", calendarId: calendar.id, type: "event", format: "ical",
@@ -88,16 +90,21 @@ test("v5 CLI advertises only reads and completes the handshake offline", async t
   assert.equal(replies.length, 2 + blocked.length);
   assert.equal(replies.find(reply => reply.id === 1).result.protocolVersion, "2025-06-18");
   assert.deepEqual(replies.find(reply => reply.id === 2).result.tools.map(tool => tool.name),
-    ["tbsyncGetSyncStatus", "listCalendars", "listCalendarEvents"]);
+    ["tbsyncListAccounts", "tbsyncGetSyncStatus", "listCalendars", "listEvents", "listCalendarEvents"]);
   for (const reply of replies.filter(item => item.id >= 3)) refusal(reply, /reads and sync status only/);
   assert.deepEqual(calls, []);
 });
 
-test("the default CLI route still forwards legacy requests to the old extension", async t => {
+test("the default CLI route authenticates to the extension using its connection file", async t => {
   const { calls, port } = await fixture(t);
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "tbsync-mcp-test-"));
+  t.after(() => fs.rm(dir, { recursive: true }));
+  const file = path.join(dir, "connection.json");
+  const token = "a".repeat(64);
+  await fs.writeFile(file, JSON.stringify({ port, token }), { mode: 0o600 });
   const input = request("tools/call", { name: "listCalendars" });
-  await runBridge(t, { TBSYNC_MCP_PORT: String(port) }, [input]);
-  assert.deepEqual(calls, [{ path: "/", method: "POST", auth: undefined, body: input }]);
+  await runBridge(t, { TBSYNC_MCP_CONNECTION_FILE: file }, [input]);
+  assert.deepEqual(calls, [{ path: "/", method: "POST", auth: `Bearer ${token}`, body: input }]);
 });
 
 test("reads iCalendar from the granted account, converting offsets to the native UTC range", async t => {
@@ -128,7 +135,7 @@ test("sync status exposes only the granted folder and separates queued edits fro
   });
   const result = unpack(await read(handle, "tbsyncGetSyncStatus"));
   assert.deepEqual(result, { accountId: "42", accountName: "Test account", folderId: "f-7",
-    folderName: "Test calendar", ready: true, calendar, status: "ok", lastSyncTime: folder.lastSyncTime,
+    folderName: "Test calendar", accountExists: true, ready: true, calendar, status: "ok", lastSyncTime: folder.lastSyncTime,
     pendingChanges: 1, pendingCalendarMessages: 1 });
   assert.deepEqual(calls.find(call => call.body.cmd === "getChangelog").body.args, { accountId: "42", folderId: "f-7" });
   assert.deepEqual(calls.find(call => call.body.cmd === "getFolders").body.args, { accountId: "42" });

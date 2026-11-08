@@ -22,16 +22,16 @@ This document is the **single source of truth** for how we operate the Thunderbi
    - Do not write to `~/.thunderbird/*/TbSync/changelog68.json` as an operational path.
    - It can fail to propagate and can destabilize folder/target selection.
 
-2) **Use TbSync-native operations for EAS**
-   Use the tools that call TbSync’s Lightning wrapper so TbSync records the correct `*_by_user` changelog entries:
-   - Create: `tbsyncCreateEasEventNative` (sets `added_by_user`)
-   - Delete: `tbsyncDeleteEasEventsNativeBySql` (sets `deleted_by_user`)
-   - Modify/Move: `tbsyncModifyEasEventsBySql` (must ensure `modified_by_user` when applicable)
+2) **Use confirmed TbSync v5 operations for EAS**
+   - Confirm the operation and supply the granted account and calendar IDs.
+   - Event changes use the scoped calendar API so EAS records them.
+   - Use a fresh event snapshot before an edit or deletion.
 
-3) **Sync strategy: one sync, then wait**
-   - Trigger **one** TbSync sync after a batch of changes.
-   - Wait 2–5 minutes for Outlook propagation before doing more writes.
-   - Do not “sync spam” on multiple machines at once (reduces cache divergence).
+3) **Verify pre-sync and post-sync**
+   - The write tools request one scoped refresh before the edit and one
+     afterward, with provider checks and local readback.
+   - Verify the result in Outlook before retrying an uncertain operation or
+     making another write on a different machine.
 
 4) **Don’t restart Thunderbird for syncing**
    - Restart only when needed to activate a newly-installed add-on build.
@@ -67,10 +67,9 @@ This document is the **single source of truth** for how we operate the Thunderbi
 Symptom:
 - `Jiachang Liu Cornell (Calendar)` disappears from Ubuntu Thunderbird and from TbSync folder list.
 
-Fix (programmatic):
-1) Run `tbsyncResetEasFolderSync` for the Cornell account (forces FolderSync refresh).
-2) Re-select the EAS folder `foldername="Calendar"` (often `serverID="2"`) via `tbsyncSelectEasCalendarFolder`.
-3) Confirm `listCalendars` includes `Jiachang Liu Cornell (Calendar)`.
+Check the account and folder in TbSync Manager. Once the calendar is bound,
+select it again in the Bridge tab and inspect `tbsyncGetSyncStatus`.
+Review unsynced local changes before using the manager's recovery controls.
 
 ## Morning planning pass (daily)
 
@@ -91,5 +90,6 @@ Fix (programmatic):
 
 ## Tooling Notes
 
-- Provider enumeration (`getItems`, `getItem`) can hang; prefer SQL-based discovery + TbSync-native write operations.
-- Avoid long-running blocking calls; prefer job-based flows when possible.
+- Read through `listEvents` over a bounded date range.
+- Keep the Bridge grant fixed during a request. To read Cornell and Duke,
+  verify each account and select its calendar separately.

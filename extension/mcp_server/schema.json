@@ -7,7 +7,7 @@
         "name": "start",
         "type": "function",
         "async": true,
-        "description": "Start the TbSync MCP HTTP server on localhost:8766",
+        "description": "Start the authenticated TbSync MCP HTTP server on a local port",
         "parameters": []
       }
     ]

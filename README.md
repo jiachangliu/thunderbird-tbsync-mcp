@@ -1,101 +1,72 @@
 # Thunderbird TbSync MCP
 
-MCP-compatible local server for **calendar synchronization and calendar edits** in Thunderbird **via TbSync + EAS-4-TbSync**.
+MCP calendar tools for Thunderbird 153+, TbSync v5 and the Exchange
+ActiveSync provider. The v5 extension checks the beta Bridge's capabilities
+and account/calendar grant through the native helper. It uses the EAS
+provider's existing change queue.
 
-This project is intentionally **separate** from `thunderbird-mcp`:
-- `thunderbird-mcp` targets **mail + lightweight calendar listing** with no dependency on TbSync.
-- `thunderbird-tbsync-mcp` targets **safe calendar write workflows** that require **explicit pre-sync and post-sync** using TbSync.
+## Setup
 
-## Why this exists
+Use TbSync 5.3.8 **beta** with the matching native helper (protocol 2) and
+EAS-4-TbSync 5.3.11. In the TbSync Manager's Bridge tab, select one EAS
+account and its calendar and leave unrestricted mode off. The normal
+ATN build of TbSync does not include the Bridge tab. The helper's loopback
+port is 47654. Its static header protects against ordinary cross-origin
+browser requests. Other local processes can reach the helper while enabled.
 
-If you edit calendars locally while the cloud calendar has newer changes, later sync/merge can get messy.
+Use the built `dist/thunderbird-tbsync-mcp.xpi` and point your MCP client
+at this checkout's `mcp-bridge.cjs` with Node. The XPI starts on a local
+port and publishes a per-session credential in
+`${TMPDIR:-/tmp}/thunderbird-tbsync-mcp/connection.json` on Linux.
+The stdio bridge reads that file automatically. If the client and Thunderbird
+use different temp directories, set `TBSYNC_MCP_CONNECTION_FILE` to that
+file's absolute path. The directory and file must be private to your user.
+For manual writes, allow the MCP client up to four minutes per request.
 
-This MCP server enforces the workflow:
+`TBSYNC_MCP_BACKEND=v5` retains the earlier direct read-only mode. Use the
+default `extension` mode for the authenticated XPI and the confirmed sync
+and write workflows. Keep the Bridge grant fixed until a request finishes.
 
-1. **Sync down** from the cloud (TbSync) for the account/calendar you will modify
-2. **Apply the local change** (create/edit event)
-3. **Sync up** to the cloud immediately (TbSync)
+## Tools
 
-The goal is to avoid divergence and reduce merge conflicts.
+- `tbsyncListAccounts` lists the single granted account and its account ID.
+- `tbsyncGetSyncStatus` reports the granted calendar, last recorded sync,
+  pending edits and queued calendar messages. A null count means the
+  provider queue was unavailable.
+- `listCalendars` and `listEvents` read the granted calendar. Event ranges
+  need an explicit UTC offset or `Z` and are limited to 31 days.
+  `listCalendarEvents` is an alias.
+- `tbsyncSyncAccount` explicitly syncs the granted account, including its
+  selected folders. It requires `accountID` and `confirm: true`, and
+  checks that the granted calendar records a fresh successful sync.
+- `createCalendarEvent`, `updateCalendarEvent`, and `deleteCalendarEvent`
+  require `accountID`, `calendarId`, and explicit `confirm: true`. The
+  workflow verifies one scoped refresh before the local edit and one
+  afterward, then checks the provider queue and reads the event back.
 
-## Architecture
+The first write implementation handles individual events without meeting
+participants or recurrence. For a create, use a unique stable `mcpTag`.
+For edits and deletes, pass the event ID and the `ical` snapshot returned by
+`listEvents` as `expectedIcal`. Read the event again if its snapshot changed.
+A write can be applied locally even when the post-sync is uncertain.
+Check the event and Outlook before retrying. Provider success and local
+readback are different from an independent Outlook check.
+See [usage](docs/USAGE.md) and [process rules](docs/PROCESS_RULES.md).
 
+## Build and test
+
+```sh
+bash scripts/build.sh
+node --test
 ```
-MCP Client <--stdio--> mcp-bridge.cjs <--HTTP--> Thunderbird Extension (localhost:8766)
-```
 
-- The Thunderbird extension runs a small local HTTP JSON-RPC server (port **8766** by default).
-- The Node.js bridge provides MCP stdio protocol and forwards requests to the HTTP server.
+To also test the iCalendar codec against Thunderbird's implementation,
+set `TBSYNC_TEST_ICAL_MODULE` to an extracted
+`modules/calendar/Ical.sys.mjs` from the installed application's
+`omni.ja`. These tests use fixtures and temporary loopback servers.
 
-## Requirements
+The v4 extension and its legacy workflows are available on the original
+branch. This package keeps the extension ID and requires Thunderbird 153.0
+or later.
 
-- Thunderbird
-- TbSync installed (`tbsync@jobisoft.de`)
-- EAS-4-TbSync installed (Exchange ActiveSync provider)
-
-If TbSync (or the EAS provider) is not installed, tools will return a clear error.
-
-## TbSync 5.x read-only backend
-
-The stdio bridge supports an opt-in backend for Thunderbird 153 ESR with
-TbSync 5.3.x **beta** and EAS-4-TbSync 5.3.x. This backend uses TbSync's native
-helper protocol 2. It does not use this project's legacy XPI or HTTP server.
-
-In a test profile, use the TbSync Manager's Bridge tab with the matching
-native helper, keep unrestricted mode off, and grant one EAS calendar.
-Set `TBSYNC_MCP_BACKEND=v5` in your MCP client's environment and point the
-client to `mcp-bridge.cjs` in this checkout. The helper listens on
-`127.0.0.1:47654` by default. Its static bearer header protects against
-simple cross-origin browser requests. Local processes can still reach
-the helper while it is enabled.
-
-- `tbsyncGetSyncStatus` reports the binding and last recorded sync, with counts
-  for unpushed edits and queued calendar messages. A `null` count means the
-  provider queue was unavailable. This call never requests a sync.
-- `listCalendars` returns the one granted EAS calendar.
-- `listCalendarEvents` takes `start` and `end` with an explicit timezone offset
-  or `Z`. It returns iCalendar records and expanded recurrence instances for
-  up to 31 days. The optional `calendarId` must match the grant. Results are
-  capped at 50 by default and at 100 when requested, with a `truncated` flag.
-
-V5 MCP writes and manual sync remain gated on live Outlook validation.
-Use a disposable Thunderbird profile and a dedicated test calendar for
-that validation. For one tagged event with no attendees, verify create,
-edit, and delete in the provider queue and independently in Outlook.
-Check that a repeated request creates no duplicates and that no calendar
-messages were queued. The repository's normal build still packages the
-legacy extension. Run `node --test` to check the v5 stdio backend offline.
-
-## Legacy tools
-
-Legacy mode remains the default. Its tools use JSON-RPC on
-`http://localhost:8766`.
-
-- `tbsyncListAccounts`
-- `tbsyncSyncAccount` (by TbSync account ID)
-- `tbsyncSyncAccountByUser` (by user email, e.g. `jl4624@cornell.edu`)
-- `listCalendars`
-- `createCalendarEvent` (**v0.1.0: all-day only**)
-- `syncAndCreateCalendarEvent` (pre-sync → create → post-sync; safest default)
-
-## Documentation
-
-Start here:
-- `docs/USAGE.md` — quick-start + copy/paste curl examples
-- `docs/TROUBLESHOOTING.md` — common issues (port not listening, hangs, dependency checks)
-- `docs/PROCESS_RULES.md` — **operational rules / source of truth** for reliable TbSync+EAS workflows
-
-## Development notes
-
-This project is meant to be open-source friendly:
-- minimal assumptions about the user’s Thunderbird setup
-- defensive checks + explicit error messages when dependencies are missing
-- careful handling of time zones and all-day events
-
-## License
-
-MIT. See `LICENSE`.
-
-### Notices
-
-This project includes/depends on components under other licenses (e.g., Mozilla/Thunderbird components under MPL-2.0). See `NOTICE.md`.
+MIT license. See [notices](NOTICE.md).

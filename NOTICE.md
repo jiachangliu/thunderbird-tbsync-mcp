@@ -22,4 +22,4 @@ This repository is MIT licensed, but it interacts with and/or bundles components
 - Thunderbird Calendar APIs (Mozilla)
   - License: MPL-2.0
 
-This project does not redistribute TbSync or EAS-4-TbSync; it only checks for their presence and calls their public/internal APIs inside Thunderbird.
+This project does not redistribute TbSync or EAS-4-TbSync; it uses the TbSync beta Bridge to call scoped calendar capabilities and Thunderbird’s built-in iCalendar library.
