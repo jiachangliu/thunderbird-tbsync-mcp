@@ -6,7 +6,8 @@ const path = require("node:path");
 const { test } = require("node:test");
 const vm = require("node:vm");
 
-test("packaged experiment publishes a private endpoint and requires its session token", async () => {
+async function fixture(helperReply = () => ({ helperVersion: 2, unrestricted: false,
+  target: { exists: true, accountId: "fixture", accountName: "Test" }, resources: {} })) {
   const core = await import("../extension/mcp_server/v5.mjs");
   const code = readFileSync(path.join(__dirname, "../extension/mcp_server/api.js"), "utf8");
   let endpoint;
@@ -38,10 +39,10 @@ test("packaged experiment publishes a private endpoint and requires its session 
       if (name === "Authorization") assert.equal(value, "Bearer tbsync");
     }
     send(payload) {
-      calls.push(JSON.parse(payload));
+      const request = JSON.parse(payload);
+      calls.push(request);
       this.status = 200;
-      this.responseText = JSON.stringify({ ok: true, result: { helperVersion: 2, unrestricted: false,
-        target: { exists: true, accountId: "fixture", accountName: "Test" }, resources: {} } });
+      this.responseText = JSON.stringify({ ok: true, result: helperReply(request.cmd, request.args) });
       this.onload();
     }
   }
@@ -56,10 +57,15 @@ test("packaged experiment publishes a private endpoint and requires its session 
         generateRandomBytes: size => Buffer.alloc(size, 1),
       }) },
       "@mozilla.org/network/safe-file-output-stream;1": { createInstance: () => stream },
+      "@mozilla.org/binaryoutputstream;1": { createInstance: () => ({
+        setOutputStream(output) { this.output = output; },
+        writeByteArray(bytes) { this.output.push(Buffer.from(bytes)); },
+      }) },
     },
     Components: { utils: { importGlobalProperties() {} } },
     Services: { dirsvc: { get: () => dir }, appinfo: { OS: "Linux", processID: 1 } },
     XMLHttpRequest: XHR,
+    TextEncoder,
     ChromeUtils: { importESModule(uri) {
       const name = uri.split("/").at(-1);
       switch (name) {
@@ -85,7 +91,9 @@ test("packaged experiment publishes a private endpoint and requires its session 
   function request(message, token) {
     const text = JSON.stringify(message);
     return new Promise(resolve => {
-      let code, body;
+      let code;
+      const bodyOutputStream = [];
+      const headers = {};
       endpoint({
         method: "POST",
         hasHeader: () => token !== undefined,
@@ -94,22 +102,76 @@ test("packaged experiment publishes a private endpoint and requires its session 
       }, {
         processAsync() {},
         setStatusLine(_version, status) { code = status; },
-        setHeader() {},
-        write(value) { body = JSON.parse(value); },
-        finish() { resolve({ code, body }); },
+        setHeader(name, value) { headers[name] = value; },
+        // httpd's string writer forwards bytes without encoding to UTF-8.
+        write(value) { bodyOutputStream.push(Buffer.from(value, "latin1")); },
+        bodyOutputStream,
+        finish() { resolve({ code, headers, bytes: Buffer.concat(bodyOutputStream) }); },
       });
     });
   }
+  return { request, token: published.token, calls, shutdown: () => {
+    instance.onShutdown();
+    assert.equal(stopped, true);
+  } };
+}
 
+function decode(response) {
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(response.bytes));
+}
+
+test("packaged experiment publishes a private endpoint and requires its session token", async () => {
+  const { request, token, calls, shutdown } = await fixture();
   const list = { jsonrpc: "2.0", id: 1, method: "tools/list" };
   assert.equal((await request(list)).code, 401);
   assert.equal((await request(list, "incorrect")).code, 401);
-  const authorized = await request(list, published.token);
+  const authorized = await request(list, token);
   assert.equal(authorized.code, 200);
-  assert.ok(authorized.body.result.tools.some(tool => tool.name === "createCalendarEvent"));
-  const accounts = await request({ ...list, method: "tools/call", params: { name: "tbsyncListAccounts" } }, published.token);
-  assert.deepEqual(JSON.parse(accounts.body.result.content[0].text), [{ accountID: "fixture", accountname: "Test" }]);
+  assert.ok(decode(authorized).result.tools.some(tool => tool.name === "createCalendarEvent"));
+  const accounts = await request({ ...list, method: "tools/call", params: { name: "tbsyncListAccounts" } }, token);
+  assert.deepEqual(JSON.parse(decode(accounts).result.content[0].text), [{ accountID: "fixture", accountname: "Test" }]);
   assert.deepEqual(calls, [{ cmd: "status", args: {}, timeoutMs: 5000 }]);
-  instance.onShutdown();
-  assert.equal(stopped, true);
+  shutdown();
+});
+
+test("packaged listEvents sends valid UTF-8 across a multi-event window", async () => {
+  const calendarId = "calendar-1";
+  const events = [
+    ["event-1", "20261109", "Calendar check", "Plain text"],
+    ["event-2", "20261118", "Échanges – 研究", "Émilie, São Paulo and Zürich 🌍"],
+  ].map(([id, date, summary, description]) => ({
+    id, calendarId, type: "event", format: "ical",
+    item: ["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", `UID:${id}`, `DTSTART;VALUE=DATE:${date}`,
+      `SUMMARY:${summary}`, `DESCRIPTION:${description}`, "END:VEVENT", "END:VCALENDAR", ""].join("\r\n"),
+  }));
+  const { request, token, shutdown } = await fixture((cmd, args) => {
+    switch (cmd) {
+      case "status":
+        return { helperVersion: 2, unrestricted: false, target: { exists: true, accountId: "fixture" },
+          resources: { calendars: { folderId: "f-1", exists: true, selected: true, bound: true,
+            targetType: "calendars" } } };
+      case "getState":
+        return { accounts: [{ accountId: "fixture", provider: "eas" }] };
+      case "calendars.get":
+        return { id: calendarId, name: "Test calendar", type: "storage" };
+      case "getFolders":
+        return { folders: [{ accountId: "fixture", folderId: "f-1", targetID: calendarId,
+          selected: true, targetType: "calendars" }] };
+      case "items.query":
+        assert.equal(args.rangeStart, "20261108T050000Z");
+        assert.equal(args.rangeEnd, "20261122T050000Z");
+        return events;
+      default:
+        assert.fail(`Unexpected command ${cmd}`);
+    }
+  });
+  const response = await request({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+    name: "listEvents",
+    arguments: { calendarId, start: "2026-11-08T00:00:00-05:00", end: "2026-11-22T00:00:00-05:00" },
+  } }, token);
+  assert.equal(response.headers["Content-Type"], "application/json; charset=utf-8");
+  const result = JSON.parse(decode(response).result.content[0].text);
+  assert.equal(result.count, 2);
+  assert.deepEqual(result.events.map(event => event.ical), events.map(event => event.item));
+  shutdown();
 });

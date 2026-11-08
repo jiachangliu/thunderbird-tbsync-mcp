@@ -1,4 +1,4 @@
-/* global ExtensionCommon, ChromeUtils, Components, Services, Cc, Ci, XMLHttpRequest */
+/* global ExtensionCommon, ChromeUtils, Components, Services, Cc, Ci, TextEncoder, XMLHttpRequest */
 "use strict";
 
 const RESOURCE_NAME = "thunderbird-tbsync-mcp-v5";
@@ -88,7 +88,14 @@ function finish(res, status, statusText, body) {
   res.setStatusLine("1.1", status, statusText);
   res.setHeader("Content-Type", "application/json; charset=utf-8", false);
   res.setHeader("Cache-Control", "no-store", false);
-  if (body !== undefined) res.write(JSON.stringify(body));
+  if (body !== undefined) {
+    // httpd's string writer narrows UTF-16 code units to bytes. The helper
+    // already supplies Unicode strings, so encode the complete JSON once.
+    const bytes = new TextEncoder().encode(JSON.stringify(body));
+    const output = Cc["@mozilla.org/binaryoutputstream;1"].createInstance(Ci.nsIBinaryOutputStream);
+    output.setOutputStream(res.bodyOutputStream);
+    output.writeByteArray(bytes);
+  }
   res.finish();
 }
 
@@ -140,7 +147,7 @@ var tbsyncMcpServer = class extends ExtensionCommon.ExtensionAPI {
         start: async () => {
           if (this.server) return { success: true, port: this.server.identity.primaryPort };
           try {
-            Components.utils.importGlobalProperties(["XMLHttpRequest"]);
+            Components.utils.importGlobalProperties(["TextEncoder", "XMLHttpRequest"]);
             const { HttpServer } = ChromeUtils.importESModule(`${RESOURCE_ROOT}httpd.sys.mjs`);
             const { NetUtil } = ChromeUtils.importESModule("resource://gre/modules/NetUtil.sys.mjs");
             const { default: ICAL } = ChromeUtils.importESModule("resource:///modules/calendar/Ical.sys.mjs");
